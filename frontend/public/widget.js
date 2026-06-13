@@ -36,7 +36,10 @@
     panel.style.display = open ? "block" : "none";
   });
   window.addEventListener("message", function (e) {
-    if (e && e.data && e.data.type === "qiq:close") {
+    // Only accept close messages from our own iframe origin to prevent
+    // arbitrary pages from forcing the widget closed.
+    if (!e || e.origin !== origin) return;
+    if (e.data && e.data.type === "qiq:close") {
       open = false;
       panel.style.display = "none";
     }
