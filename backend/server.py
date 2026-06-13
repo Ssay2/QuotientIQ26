@@ -20,6 +20,9 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, BeforeValidator
 from pypdf import PdfReader
+from docx import Document as DocxDocument
+from bs4 import BeautifulSoup
+import requests
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
 
@@ -117,6 +120,23 @@ class AgentPatch(BaseModel):
     description: Optional[str] = None
     category: Optional[str] = None
     icon: Optional[str] = None
+    parent_agent_id: Optional[str] = None
+
+class CompanyProfileIn(BaseModel):
+    company_name: str = ""
+    products: str = ""
+    services: str = ""
+    pricing: str = ""
+    brand_voice: str = ""
+    policies: str = ""
+    audience: str = ""
+
+class TextIngestIn(BaseModel):
+    label: str = "Pasted text"
+    text: str
+
+class UrlIngestIn(BaseModel):
+    url: str
 
 class ChatMessageIn(BaseModel):
     message: str
@@ -220,6 +240,15 @@ async def get_agent(agent_id: str, user: dict = Depends(get_current_user)):
 @api.patch("/agents/{agent_id}")
 async def update_agent(agent_id: str, body: AgentPatch, user: dict = Depends(get_current_user)):
     updates = body.model_dump(exclude_unset=True)
+    # Validate parent_agent_id if provided
+    if "parent_agent_id" in updates and updates["parent_agent_id"]:
+        parent = await db.agents.find_one(
+            {"_id": to_object_id(updates["parent_agent_id"], "parent agent id"), "user_id": user["id"]}
+        )
+        if not parent:
+            raise HTTPException(400, "Parent agent not found")
+        if updates["parent_agent_id"] == agent_id:
+            raise HTTPException(400, "Agent cannot be its own parent")
     if updates:
         await db.agents.update_one(
             {"_id": to_object_id(agent_id, "agent id"), "user_id": user["id"]},
@@ -236,35 +265,99 @@ async def delete_agent(agent_id: str, user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 # ---------------- Knowledge Base ----------------
+# ---------------- Knowledge Base ingestion helpers ----------------
+def _extract_pdf(content: bytes) -> str:
+    reader = PdfReader(io.BytesIO(content))
+    return "\n".join((p.extract_text() or "") for p in reader.pages).strip()
+
+def _extract_docx(content: bytes) -> str:
+    doc = DocxDocument(io.BytesIO(content))
+    return "\n".join(p.text for p in doc.paragraphs if p.text).strip()
+
+def _extract_url(url: str) -> tuple[str, str]:
+    """Fetch a URL and return (title, plaintext)."""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    resp = requests.get(url, timeout=15, headers={"User-Agent": "QuotientIQ-KB/1.0"})
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    title = (soup.title.string.strip() if soup.title and soup.title.string else url)[:120]
+    text = " ".join(soup.get_text(" ").split())
+    return title, text[:60000]
+
+async def _append_to_knowledge(agent_id: str, label: str, text: str, file_meta: dict) -> dict:
+    oid = to_object_id(agent_id, "agent id")
+    a = await db.agents.find_one({"_id": oid})
+    if not a:
+        raise HTTPException(404, "Agent not found")
+    new_text = (a.get("knowledge_text", "") + "\n\n" + f"### {label}\n" + text).strip()
+    files = a.get("knowledge_files", []) + [file_meta]
+    await db.agents.update_one(
+        {"_id": oid},
+        {"$set": {"knowledge_text": new_text[:300000], "knowledge_files": files}},
+    )
+    return {"ok": True, "filename": label, "chars": len(text), "files": files}
+
 @api.post("/agents/{agent_id}/upload")
 async def upload_pdf(agent_id: str, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     oid = to_object_id(agent_id, "agent id")
     a = await db.agents.find_one({"_id": oid, "user_id": user["id"]})
     if not a:
         raise HTTPException(404, "Agent not found")
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported")
+    name = (file.filename or "").lower()
     content = await file.read()
     try:
-        reader = PdfReader(io.BytesIO(content))
-        text = "\n".join((p.extract_text() or "") for p in reader.pages)
+        if name.endswith(".pdf"):
+            text = _extract_pdf(content)
+        elif name.endswith(".docx"):
+            text = _extract_docx(content)
+        elif name.endswith((".txt", ".md", ".csv")):
+            text = content.decode("utf-8", errors="replace").strip()
+        else:
+            raise HTTPException(400, "Supported types: PDF, DOCX, TXT, MD, CSV")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(400, f"Could not parse PDF: {e}")
-    text = text.strip()
+        raise HTTPException(400, f"Could not parse file: {e}")
     if not text:
-        raise HTTPException(400, "PDF appears to contain no extractable text")
-    new_text = (a.get("knowledge_text", "") + "\n\n" + f"### {file.filename}\n" + text).strip()
-    files = a.get("knowledge_files", []) + [{
+        raise HTTPException(400, "File contained no extractable text")
+    meta = {
         "name": file.filename,
+        "kind": name.rsplit(".", 1)[-1] if "." in name else "file",
         "size": len(content),
         "chars": len(text),
         "uploaded_at": now_iso(),
-    }]
-    await db.agents.update_one(
-        {"_id": oid},
-        {"$set": {"knowledge_text": new_text[:200000], "knowledge_files": files}}
-    )
-    return {"ok": True, "filename": file.filename, "chars": len(text), "files": files}
+    }
+    return await _append_to_knowledge(agent_id, file.filename, text, meta)
+
+@api.post("/agents/{agent_id}/ingest-text")
+async def ingest_text(agent_id: str, body: TextIngestIn, user: dict = Depends(get_current_user)):
+    a = await db.agents.find_one({"_id": to_object_id(agent_id, "agent id"), "user_id": user["id"]})
+    if not a:
+        raise HTTPException(404, "Agent not found")
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(400, "Text is empty")
+    meta = {"name": body.label or "Pasted text", "kind": "text", "size": len(text),
+            "chars": len(text), "uploaded_at": now_iso()}
+    return await _append_to_knowledge(agent_id, meta["name"], text, meta)
+
+@api.post("/agents/{agent_id}/ingest-url")
+async def ingest_url(agent_id: str, body: UrlIngestIn, user: dict = Depends(get_current_user)):
+    a = await db.agents.find_one({"_id": to_object_id(agent_id, "agent id"), "user_id": user["id"]})
+    if not a:
+        raise HTTPException(404, "Agent not found")
+    try:
+        title, text = _extract_url(body.url)
+    except Exception as e:
+        raise HTTPException(400, f"Could not fetch URL: {e}")
+    if not text:
+        raise HTTPException(400, "URL had no extractable text")
+    meta = {"name": f"{title} ({body.url})", "kind": "url", "size": len(text),
+            "chars": len(text), "uploaded_at": now_iso(), "source_url": body.url}
+    return await _append_to_knowledge(agent_id, meta["name"], text, meta)
 
 @api.delete("/agents/{agent_id}/files/{filename}")
 async def delete_file(agent_id: str, filename: str, user: dict = Depends(get_current_user)):
@@ -327,19 +420,65 @@ async def _get_or_create_conversation(agent_id: str, user_id: str, body: "ChatMe
     res = await db.conversations.insert_one(new_conv)
     return str(res.inserted_id), new_conv
 
+async def _get_company_profile(user_id: str) -> dict:
+    return await db.company_profiles.find_one({"user_id": user_id}) or {}
+
+async def _get_team_context(user_id: str, current_agent_id: str) -> str:
+    teammates = await db.agents.find(
+        {"user_id": user_id, "_id": {"$ne": to_object_id(current_agent_id, "agent id")}}
+    ).to_list(50)
+    if not teammates:
+        return ""
+    lines = [f"- {a.get('name')} ({a.get('role') or a.get('category')})" for a in teammates]
+    return "\n".join(lines)
+
+def _format_profile_block(profile: dict) -> str:
+    fields = [
+        ("Company", profile.get("company_name", "")),
+        ("Audience", profile.get("audience", "")),
+        ("Products", profile.get("products", "")),
+        ("Services", profile.get("services", "")),
+        ("Pricing", profile.get("pricing", "")),
+        ("Policies", profile.get("policies", "")),
+        ("Brand voice", profile.get("brand_voice", "")),
+    ]
+    lines = [f"{k}: {v}" for k, v in fields if v and str(v).strip()]
+    return "\n".join(lines)
+
+async def _build_system_message_full(agent: dict) -> str:
+    base = agent.get("instructions") or "You are a helpful AI assistant."
+    parts = [base]
+
+    profile = await _get_company_profile(agent["user_id"])
+    profile_block = _format_profile_block(profile)
+    if profile_block:
+        parts.append("--- COMPANY PROFILE ---\n" + profile_block + "\n--- END COMPANY PROFILE ---")
+
+    team = await _get_team_context(agent["user_id"], str(agent["_id"]))
+    if team:
+        parts.append(
+            "--- YOUR TEAM ---\nYou collaborate with the following AI teammates. If a question is outside your scope, suggest the user talk to the right teammate by name:\n"
+            + team
+            + "\n--- END TEAM ---"
+        )
+
+    kb = (agent.get("knowledge_text") or "").strip()
+    if kb:
+        parts.append(
+            "--- KNOWLEDGE BASE ---\n"
+            + kb[:30000]
+            + "\n--- END KNOWLEDGE BASE ---\nAnswer based strictly on the knowledge base above when possible. If the answer is not in the knowledge base or company profile, say you don't have that information."
+        )
+
+    return "\n\n".join(parts)
+
 def _build_system_message(agent: dict) -> str:
+    # Kept for backward compatibility (sync code paths).
     base = agent.get("instructions") or "You are a helpful AI assistant."
     kb = (agent.get("knowledge_text") or "").strip()
     if not kb:
         return base
-    return (
-        base
-        + "\n\n--- KNOWLEDGE BASE ---\n"
-        + kb[:30000]
-        + "\n--- END KNOWLEDGE BASE ---\n\n"
-        + "Answer based strictly on the knowledge base above when possible. "
-        + "If the answer is not in the knowledge base, say you don't have that information."
-    )
+    return base + "\n\n--- KNOWLEDGE BASE ---\n" + kb[:30000]
 
 def _build_user_text(latest: str, prev_messages: list[dict]) -> str:
     recent = (prev_messages or [])[-10:]
@@ -376,7 +515,7 @@ async def chat_with_agent(agent_id: str, body: ChatMessageIn, user: dict = Depen
     conv_id, conv = await _get_or_create_conversation(agent_id, user["id"], body)
     await _append_user_message(conv_id, body.message)
 
-    chat = _make_llm_chat(conv_id, _build_system_message(agent))
+    chat = _make_llm_chat(conv_id, await _build_system_message_full(agent))
     user_message = UserMessage(text=_build_user_text(body.message, conv.get("messages")))
 
     async def event_stream():
@@ -407,7 +546,7 @@ async def chat_sync(agent_id: str, body: ChatMessageIn, user: dict = Depends(get
     agent = await _load_agent_or_404(agent_id, user["id"])
     conv_id, conv = await _get_or_create_conversation(agent_id, user["id"], body)
 
-    chat = _make_llm_chat(conv_id, _build_system_message(agent))
+    chat = _make_llm_chat(conv_id, await _build_system_message_full(agent))
     full = ""
     async for ev in chat.stream_message(UserMessage(text=body.message)):
         if isinstance(ev, TextDelta):
@@ -502,6 +641,51 @@ async def install_template(template_id: str, user: dict = Depends(get_current_us
     doc.pop("_id", None)
     return doc
 
+# ---------------- Company Profile (Memory layer) ----------------
+@api.get("/company-profile")
+async def get_company_profile(user: dict = Depends(get_current_user)):
+    doc = await db.company_profiles.find_one({"user_id": user["id"]})
+    if not doc:
+        return {
+            "company_name": user.get("company", ""),
+            "products": "", "services": "", "pricing": "",
+            "brand_voice": "", "policies": "", "audience": "",
+        }
+    doc["id"] = str(doc.pop("_id"))
+    return doc
+
+@api.put("/company-profile")
+async def save_company_profile(body: CompanyProfileIn, user: dict = Depends(get_current_user)):
+    updates = body.model_dump()
+    updates["user_id"] = user["id"]
+    updates["updated_at"] = now_iso()
+    await db.company_profiles.update_one(
+        {"user_id": user["id"]},
+        {"$set": updates, "$setOnInsert": {"created_at": now_iso()}},
+        upsert=True,
+    )
+    return {"ok": True, **updates}
+
+# ---------------- Org Chart ----------------
+@api.get("/org/tree")
+async def org_tree(user: dict = Depends(get_current_user)):
+    agents = await db.agents.find({"user_id": user["id"]}).to_list(500)
+    for a in agents:
+        a["id"] = str(a.pop("_id"))
+        # Strip heavy fields
+        a.pop("knowledge_text", None)
+
+    by_parent: dict[str, list] = {}
+    for a in agents:
+        parent = a.get("parent_agent_id") or "__root__"
+        by_parent.setdefault(parent, []).append(a)
+
+    def build(parent_id: str):
+        nodes = by_parent.get(parent_id, [])
+        return [{**a, "children": build(a["id"])} for a in nodes]
+
+    return {"roots": build("__root__"), "count": len(agents)}
+
 @api.get("/")
 async def root():
     return {"service": "QuotientIQ API", "status": "ok"}
@@ -524,7 +708,9 @@ logger = logging.getLogger(__name__)
 async def startup():
     await db.users.create_index("email", unique=True)
     await db.agents.create_index("user_id")
+    await db.agents.create_index([("user_id", 1), ("parent_agent_id", 1)])
     await db.conversations.create_index([("user_id", 1), ("agent_id", 1)])
+    await db.company_profiles.create_index("user_id", unique=True)
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@quotientiq.com").lower()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")

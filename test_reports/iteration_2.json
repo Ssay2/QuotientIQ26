@@ -1,0 +1,38 @@
+{
+  "summary": "QuotientIQ V2 end-to-end testing complete. Backend: 31/31 pytest tests pass (18 prior regression + 13 new V2 tests covering company profile GET/PUT defaults & upsert, text/URL ingestion + 400 on bad inputs, DOCX/TXT multi-format upload + unsupported rejected, org tree structure + reparent + self-parent/invalid-parent 400s, chat-sync uses company profile and team context — agent A correctly named 'ProfTest Co' and referenced teammate 'AgentBravoUnique'). Frontend: /profile renders all 7 fields with correct data-testids, save persists across reload; /org renders tree with org-node-{id} and reparent-{id} selectors; sidebar exposes nav-org and nav-profile (confirmed visually); chat KnowledgePanel exposes all 3 tabs (file/text/url) with correct testids and input switching. No regressions in dashboard / marketplace / chat layout.",
+  "backend_issues": { "critical": [], "minor": [] },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Optional / from V1) Add brute-force lockout on /api/auth/login (5-attempt limit per auth_testing.md).",
+    "(Optional) Server.py is now ~750 lines — consider splitting into routers (auth, agents, knowledge, chat, marketplace, analytics, profile, org) before further growth.",
+    "(Optional) /api/org/tree currently strips knowledge_text but still returns knowledge_files; consider also trimming for lighter payloads.",
+    "(Optional) Updated the previously stale V1 test 'test_upload_non_pdf_rejected' to 'test_upload_unsupported_ext_rejected' since V2 now accepts .txt/.md/.csv. No code change required."
+  ],
+  "critical_code_review_comments": [
+    "CompanyProfileIn allows arbitrary-length strings — consider per-field max_length (e.g. 5k chars) to bound token usage in _build_system_message_full.",
+    "_extract_url uses synchronous requests.get inside an async endpoint — blocks the event loop for up to 15s. Wrap in asyncio.to_thread or use httpx.AsyncClient.",
+    "_get_team_context limits to 50 teammates but does no projection; minor — fine for MVP.",
+    "PATCH /api/agents/{id} with parent_agent_id set to empty string is allowed (the `if updates['parent_agent_id']` short-circuits validation) — that's intentional for 'move to top level' but worth documenting.",
+    "Org tree does not detect parent cycles (A->B->A). Self-parent is blocked, but multi-hop cycles would loop in build(). Add a cycle check.",
+    "company_profiles collection has a unique index on user_id (good); GET default response returns no `id` field which is intentional for the unsaved state — confirm frontend handles this.",
+    "CORS still allow_origins=['*'] with allow_credentials=True — preview-friendly, tighten for prod."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py (added 13 V2 tests; renamed stale txt-rejected test)"
+  ],
+  "success_rate": { "backend": "100% (31/31)", "frontend": "100% on critical V2 flows" },
+  "test_credentials": "Admin admin@quotientiq.com / admin123 works. Fresh users registered with company='Acme' yield company_name='Acme' in default profile.",
+  "seed_data_creation": "Multiple TEST_ prefixed agents created and cleaned up inline by org/chat tests. Several test_*@quotientiq.com users persist (harmless). Admin company_profile row now contains 'ProfTest UI Co' from the frontend persistence check — main agent may wish to clean if desired.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend regression suite at /app/backend/tests/backend_test.py now has 31 tests across 11 classes (Health, Auth, SeededAgent, Agents, Marketplace, PDFUpload, Chat, Analytics, CompanyProfile, IngestText, IngestUrl, MultiFormatUpload, OrgTree, ChatV2Context). Run: ADMIN_PASSWORD=admin123 pytest /app/backend/tests/backend_test.py -v. Chat context test uses model gpt-5.2 and asserts the company name 'ProfTest' and teammate name fragment 'AgentBravoUnique' in the LLM reply — if the LLM behavior drifts, this assertion may flake; consider it a soft signal.",
+  "rca of the issue": "No bugs found in V2. The only test failure during execution was the V1 'test_upload_non_pdf_rejected' which expected .txt to 400; V2 deliberately accepts .txt (per spec), so the test was rewritten to assert .exe is rejected — verified passing."
+}

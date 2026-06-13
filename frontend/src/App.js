@@ -12,6 +12,8 @@ import Chat from "@/pages/Chat";
 import Marketplace from "@/pages/Marketplace";
 import Builder from "@/pages/Builder";
 import Analytics from "@/pages/Analytics";
+import CompanyProfile from "@/pages/CompanyProfile";
+import OrgChart from "@/pages/OrgChart";
 
 function PublicOnly({ children }) {
   const { user, loading } = useAuth();
@@ -33,6 +35,8 @@ export default function App() {
           <Route path="/marketplace" element={<Protected><Marketplace /></Protected>} />
           <Route path="/builder" element={<Protected><Builder /></Protected>} />
           <Route path="/analytics" element={<Protected><Analytics /></Protected>} />
+          <Route path="/profile" element={<Protected><CompanyProfile /></Protected>} />
+          <Route path="/org" element={<Protected><OrgChart /></Protected>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
         <Toaster position="bottom-right" />

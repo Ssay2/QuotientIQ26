@@ -2,11 +2,13 @@ import React from "react";
 import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
-import { LayoutGrid, MessagesSquare, Store, Wrench, BarChart3, LogOut, Sparkles } from "lucide-react";
+import { LayoutGrid, Store, Wrench, BarChart3, LogOut, Sparkles, Brain, Network } from "lucide-react";
 
 const NAV = [
   { to: "/dashboard", label: "Dashboard", icon: LayoutGrid, tid: "nav-dashboard" },
   { to: "/marketplace", label: "Marketplace", icon: Store, tid: "nav-marketplace" },
+  { to: "/org", label: "Org Chart", icon: Network, tid: "nav-org" },
+  { to: "/profile", label: "Memory", icon: Brain, tid: "nav-profile" },
   { to: "/builder", label: "Builder", icon: Wrench, tid: "nav-builder" },
   { to: "/analytics", label: "Analytics", icon: BarChart3, tid: "nav-analytics" },
 ];
@@ -17,7 +19,6 @@ export default function AppShell({ children }) {
 
   return (
     <div className="min-h-screen flex bg-background">
-      {/* Sidebar */}
       <aside className="hidden md:flex w-64 shrink-0 flex-col border-r border-border bg-white">
         <Link to="/dashboard" className="flex items-center gap-2 px-6 h-16 border-b border-border" data-testid="brand-link">
           <div className="size-7 bg-black grid place-items-center">
@@ -62,7 +63,6 @@ export default function AppShell({ children }) {
         </div>
       </aside>
 
-      {/* Mobile top bar */}
       <div className="md:hidden fixed top-0 inset-x-0 h-14 bg-white border-b border-border flex items-center justify-between px-4 z-40">
         <Link to="/dashboard" className="flex items-center gap-2">
           <div className="size-6 bg-black grid place-items-center">
@@ -70,7 +70,7 @@ export default function AppShell({ children }) {
           </div>
           <span className="font-display font-medium">QuotientIQ</span>
         </Link>
-        <Button variant="ghost" size="sm" data-testid="mobile-logout" onClick={async () => { await logout(); nav("/"); }}>
+        <Button variant="ghost" size="sm" data-testid="mobile-logout" onClick={async () => { await logout(); nav("/"); }} aria-label="Logout">
           <LogOut className="size-4" strokeWidth={1.5} />
         </Button>
       </div>

@@ -114,12 +114,14 @@ export default function Chat() {
           <aside className={`border-l border-border bg-muted/20 overflow-y-auto ${showSettings ? "block" : "hidden lg:block"}`}>
             <div className="p-6 space-y-6">
               <KnowledgePanel
+                agentId={agentId}
                 files={files}
                 uploading={uploading}
                 fileInputRef={fileRef}
                 onPickFile={() => fileRef.current?.click()}
                 onFileChange={handleUpload}
                 onRemoveFile={handleRemoveFile}
+                onRefresh={refresh}
               />
               <InstructionsPanel
                 value={agent.instructions || ""}
