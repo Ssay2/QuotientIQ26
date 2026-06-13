@@ -1,0 +1,109 @@
+{
+  "theme": "light",
+  "archetype": "4 - Swiss & High-Contrast",
+  "design_philosophy": "Inspired by OpenAI, Stripe, Vercel. Minimal, Enterprise-grade, Black and white, Lots of whitespace, Clean typography, Premium feel. 95% monochrome with color as function only.",
+  "colors": {
+    "background": "#FFFFFF",
+    "foreground": "#0A0A0A",
+    "card": "#FFFFFF",
+    "card_foreground": "#0A0A0A",
+    "popover": "#FFFFFF",
+    "popover_foreground": "#0A0A0A",
+    "primary": "#000000",
+    "primary_foreground": "#FFFFFF",
+    "secondary": "#F5F5F5",
+    "secondary_foreground": "#171717",
+    "muted": "#FAFAFA",
+    "muted_foreground": "#737373",
+    "accent": "#FAFAFA",
+    "accent_foreground": "#171717",
+    "destructive": "#E53E3E",
+    "destructive_foreground": "#FFFFFF",
+    "border": "#E5E5E5",
+    "input": "#E5E5E5",
+    "ring": "#0A0A0A",
+    "chart_1": "#0A0A0A",
+    "chart_2": "#525252",
+    "chart_3": "#A3A3A3",
+    "chart_4": "#D4D4D4",
+    "chart_5": "#E5E5E5"
+  },
+  "typography": {
+    "font_family": {
+      "headings": "'Outfit', sans-serif",
+      "body": "'IBM Plex Sans', sans-serif",
+      "mono": "'JetBrains Mono', monospace"
+    },
+    "hierarchy": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl tracking-tighter font-medium",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl tracking-tight font-medium",
+      "h3": "text-xl sm:text-2xl tracking-tight font-medium",
+      "h4": "text-lg sm:text-xl tracking-tight font-medium",
+      "body": "text-base leading-relaxed text-muted-foreground",
+      "small": "text-sm tracking-wide text-muted-foreground",
+      "overline": "text-xs tracking-[0.2em] uppercase font-semibold text-muted-foreground"
+    }
+  },
+  "spacing_and_layout": {
+    "generous_spacing": "Use p-8, p-12, p-16 for containers to create breathing room. Do not cramp elements.",
+    "bento_grid": "Use grid-cols-1 md:grid-cols-3 lg:grid-cols-4 with gap-6 for Dashboards. Use grid-cols-1 md:grid-cols-12 with gap-8 to gap-12 for Landing page.",
+    "border_radius": "max 8px (rounded-lg). Prefer rounded-md or rounded-sm for inputs and buttons. No bubbly shapes.",
+    "alignment": "Left-align dense text and forms. Avoid centering unless it's a specific hero statement."
+  },
+  "surfaces_and_shadows": {
+    "cards": "Flat solid background with a crisp 1px border (border-border). No default shadow. Hover: slight lift (-translate-y-1) and subtle shadow (shadow-sm).",
+    "glassmorphism": "Only for sticky headers: bg-white/70 backdrop-blur-xl border-b border-border/50.",
+    "grid_borders": "For the analytics and marketplace section, use 'border-collapse' style with border-r and border-b on grid items to expose the 'Technical Skeleton'.",
+    "hover_states": "Always explicitly define hover:bg and hover:text to ensure high contrast."
+  },
+  "components": {
+    "buttons": "Shadcn Button. Primary: bg-black text-white hover:bg-black/90. Secondary: border border-input bg-transparent hover:bg-accent hover:text-accent-foreground. Use data-testid on all.",
+    "inputs": "Shadcn Input, Select, Form. Use standard h-10 with crisp 1px borders.",
+    "tables": "Shadcn Table. Used heavily in the Analytics dashboard.",
+    "dialogs": "Shadcn Dialog. Dark backdrop (bg-black/40) with sharp white modal surface.",
+    "badges": "Minimal. Bordered with transparent background or soft gray (bg-muted).",
+    "charts": "Recharts or Shadcn Charts. Monochrome lines and bars (black, dark gray, light gray). No colorful pies unless representing bad/good (red/black)."
+  },
+  "motion": {
+    "transitions": "Fast and precise. transition-all duration-200 ease-in-out.",
+    "hover": "Translate Y (-1px) for cards, subtle background color shifts for list items."
+  },
+  "icons": {
+    "library": "lucide-react",
+    "style": "Stroke width 1.5, simple and clean."
+  },
+  "media": {
+    "image_urls": [
+      {
+        "url": "https://images.unsplash.com/photo-1486551937199-baf066858de7?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzd8MHwxfHNlYXJjaHwyfHxhYnN0cmFjdCUyMGJsYWNrJTIwYW5kJTIwd2hpdGUlMjBnZW9tZXRyaWMlMjB0ZWNobm9sb2d5fGVufDB8fHx8MTc4MTMzMDU4MHww&ixlib=rb-4.1.0&q=85",
+        "description": "Gray digital wallpaper lattice. Use for landing page abstract background or hero banner section (with overlay)."
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1482053450283-3e0b78b09a70?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzd8MHwxfHNlYXJjaHwxfHxhYnN0cmFjdCUyMGJsYWNrJTIwYW5kJTIwd2hpdGUlMjBnZW9tZXRyaWMlMjB0ZWNobm9sb2d5fGVufDB8fHx8MTc4MTMzMDU4MHww&ixlib=rb-4.1.0&q=85",
+        "description": "Curved white latticework. Use for agent builder empty states or marketplace background texture."
+      },
+      {
+        "url": "https://images.pexels.com/photos/21898300/pexels-photo-21898300.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Pexels logo on black. Use as a 'trusted by' company logo on the landing page."
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1765448808249-a3610f38e612?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzB8MHwxfHNlYXJjaHwyfHxjb21wYW55JTIwbG9nbyUyMGJsYWNrJTIwYW5kJTIwd2hpdGV8ZW58MHx8fHwxNzgxMzMwNTgwfDA&ixlib=rb-4.1.0&q=85",
+        "description": "Kraft logo on black. Use as a 'trusted by' company logo on the landing page."
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1764722053231-9162ed8831d2?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2NDN8MHwxfHNlYXJjaHwxfHxwcm9mZXNzaW9uYWwlMjBvZmZpY2UlMjBibGFjayUyMGFuZCUyMHdoaXRlfGVufDB8fHx8MTc4MTMzMDU4MHww&ixlib=rb-4.1.0&q=85",
+        "description": "Black and white portrait of woman at desk. Use in 'Hire AI Employees' section or testimonial."
+      }
+    ],
+    "hero_overlay": "bg-white/40 to bg-white/70 gradient, ensuring text contrast if placed over abstract white/gray background."
+  },
+  "instructions_to_main_agent": [
+    "Install Google Fonts: Outfit, IBM Plex Sans, and JetBrains Mono.",
+    "Update tailwind.config.js and index.css to use the minimalist monochromatic color palette defined here.",
+    "Use grid layouts with 1px border on children for the 'dashboard analytics' to give it a technical framework feel.",
+    "Do NOT use gradients unless it's a subtle white/gray background wash.",
+    "Rely heavily on typography tracking and weights for hierarchy. Keep UI adornments to a minimum.",
+    "Include data-testid on all interactive elements.",
+    "Ensure 'Agent Builder' and 'Chat' interfaces feel like IDEs or high-end technical tools (monospace fonts for labels/data, strict margins)."
+  ]
+}
