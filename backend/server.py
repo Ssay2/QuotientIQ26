@@ -3,6 +3,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+import asyncio
 import os
 import io
 import jwt
@@ -240,15 +241,29 @@ async def get_agent(agent_id: str, user: dict = Depends(get_current_user)):
 @api.patch("/agents/{agent_id}")
 async def update_agent(agent_id: str, body: AgentPatch, user: dict = Depends(get_current_user)):
     updates = body.model_dump(exclude_unset=True)
-    # Validate parent_agent_id if provided
     if "parent_agent_id" in updates and updates["parent_agent_id"]:
+        new_parent = updates["parent_agent_id"]
+        if new_parent == agent_id:
+            raise HTTPException(400, "Agent cannot be its own parent")
         parent = await db.agents.find_one(
-            {"_id": to_object_id(updates["parent_agent_id"], "parent agent id"), "user_id": user["id"]}
+            {"_id": to_object_id(new_parent, "parent agent id"), "user_id": user["id"]}
         )
         if not parent:
             raise HTTPException(400, "Parent agent not found")
-        if updates["parent_agent_id"] == agent_id:
-            raise HTTPException(400, "Agent cannot be its own parent")
+        # Walk up the ancestry of the proposed parent to detect cycles.
+        seen = {agent_id}
+        cursor_id = new_parent
+        for _ in range(100):
+            if cursor_id in seen:
+                raise HTTPException(400, "Reparent would create a cycle")
+            seen.add(cursor_id)
+            node = await db.agents.find_one(
+                {"_id": to_object_id(cursor_id, "agent id"), "user_id": user["id"]},
+                {"parent_agent_id": 1},
+            )
+            cursor_id = node.get("parent_agent_id") if node else None
+            if not cursor_id:
+                break
     if updates:
         await db.agents.update_one(
             {"_id": to_object_id(agent_id, "agent id"), "user_id": user["id"]},
@@ -274,8 +289,8 @@ def _extract_docx(content: bytes) -> str:
     doc = DocxDocument(io.BytesIO(content))
     return "\n".join(p.text for p in doc.paragraphs if p.text).strip()
 
-def _extract_url(url: str) -> tuple[str, str]:
-    """Fetch a URL and return (title, plaintext)."""
+def _extract_url_sync(url: str) -> tuple[str, str]:
+    """Fetch a URL and return (title, plaintext). Blocking — must be run in a thread."""
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     resp = requests.get(url, timeout=15, headers={"User-Agent": "QuotientIQ-KB/1.0"})
@@ -286,6 +301,10 @@ def _extract_url(url: str) -> tuple[str, str]:
     title = (soup.title.string.strip() if soup.title and soup.title.string else url)[:120]
     text = " ".join(soup.get_text(" ").split())
     return title, text[:60000]
+
+async def _extract_url(url: str) -> tuple[str, str]:
+    # Run the blocking requests call in a worker thread so we don't stall the event loop.
+    return await asyncio.to_thread(_extract_url_sync, url)
 
 async def _append_to_knowledge(agent_id: str, label: str, text: str, file_meta: dict) -> dict:
     oid = to_object_id(agent_id, "agent id")
@@ -350,7 +369,7 @@ async def ingest_url(agent_id: str, body: UrlIngestIn, user: dict = Depends(get_
     if not a:
         raise HTTPException(404, "Agent not found")
     try:
-        title, text = _extract_url(body.url)
+        title, text = await _extract_url(body.url)
     except Exception as e:
         raise HTTPException(400, f"Could not fetch URL: {e}")
     if not text:
