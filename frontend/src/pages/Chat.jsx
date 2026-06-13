@@ -71,20 +71,19 @@ export default function Chat() {
           } else if (part.startsWith("data: ")) {
             const chunk = part.slice(6);
             setMessages((m) => {
-              const next = [...m];
-              const last = next[next.length - 1];
-              if (last && last.role === "assistant") last.content += chunk;
-              return next;
+              if (m.length === 0) return m;
+              const last = m[m.length - 1];
+              if (last.role !== "assistant") return m;
+              return [...m.slice(0, -1), { ...last, content: last.content + chunk }];
             });
           }
         }
       }
     } catch (e) {
       setMessages((m) => {
-        const next = [...m];
-        const last = next[next.length - 1];
-        if (last) last.content = `[Error: ${e.message}]`;
-        return next;
+        if (m.length === 0) return m;
+        const last = m[m.length - 1];
+        return [...m.slice(0, -1), { ...last, content: `[Error: ${e.message}]` }];
       });
       toast.error("Chat failed: " + e.message);
     } finally { setBusy(false); }
