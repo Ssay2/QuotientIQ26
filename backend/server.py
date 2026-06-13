@@ -56,6 +56,13 @@ EMBED_TOKEN_MAX_PER_HOUR = 200
 EMBED_VISITOR_MAX_PER_HOUR = 40
 EMBED_WINDOW_SECONDS = 3600
 
+# Trial config
+TRIAL_DAYS = 14
+PAID_PLANS = {"starter", "professional", "enterprise"}
+
+# Team roles
+TEAM_ROLES = ("owner", "admin", "manager", "employee")
+
 # ---------------- Validation Helpers ----------------
 def to_object_id(value: str, label: str = "id") -> ObjectId:
     """Convert a string to ObjectId or raise HTTP 400."""
@@ -73,6 +80,39 @@ def hash_password(pw: str) -> str:
 
 def verify_password(pw: str, hashed: str) -> bool:
     return bcrypt.checkpw(pw.encode("utf-8"), hashed.encode("utf-8"))
+
+def trial_days_remaining(user: dict) -> int:
+    """Return days remaining in trial. Negative = expired. Paid users return a large number."""
+    if user.get("plan") in PAID_PLANS:
+        return 9999
+    started = user.get("trial_started_at") or user.get("created_at")
+    if not started:
+        return TRIAL_DAYS
+    try:
+        ts = datetime.fromisoformat(started.replace("Z", "+00:00")) if isinstance(started, str) else started
+        elapsed = (datetime.now(timezone.utc) - ts).total_seconds()
+        return int(TRIAL_DAYS - (elapsed / 86400))
+    except Exception:
+        return TRIAL_DAYS
+
+def is_active(user: dict) -> bool:
+    """User can perform paid actions: in trial OR has an active paid plan."""
+    return user.get("plan") in PAID_PLANS or trial_days_remaining(user) > 0
+
+async def audit_log(user_id: str, action: str, target_type: str = "", target_id: str = "", metadata: Optional[dict] = None) -> None:
+    """Append an audit log entry. Never raise — auditing must not break operations."""
+    try:
+        await db.audit_logs.insert_one({
+            "user_id": user_id,
+            "action": action,
+            "target_type": target_type,
+            "target_id": target_id,
+            "metadata": metadata or {},
+            "ts": now_iso(),
+            "ts_dt": datetime.now(timezone.utc),
+        })
+    except Exception:
+        pass
 
 def get_jwt_secret() -> str:
     return os.environ["JWT_SECRET"]
@@ -94,11 +134,26 @@ def set_auth_cookies(response: Response, access: str, refresh: str):
     response.set_cookie("refresh_token", refresh, httponly=True, secure=True, samesite="none", max_age=604800, path="/")
 
 async def get_current_user(request: Request) -> dict:
+    # 1) API key auth: Authorization: Bearer qiq_<token>
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer qiq_"):
+        raw = auth_header[7:]  # strip "Bearer "
+        import hashlib
+        sha = hashlib.sha256(raw.encode()).hexdigest()
+        key_doc = await db.api_keys.find_one({"key_sha256": sha, "active": True})
+        if key_doc:
+            await db.api_keys.update_one({"_id": key_doc["_id"]}, {"$set": {"last_used_at": now_iso()}})
+            user = await db.users.find_one({"_id": ObjectId(key_doc["user_id"])})
+            if user:
+                user["id"] = str(user.pop("_id"))
+                user.pop("password_hash", None)
+                user["auth_via"] = "api_key"
+                return user
+
+    # 2) Cookie / Bearer JWT auth
     token = request.cookies.get("access_token")
-    if not token:
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            token = auth[7:]
+    if not token and auth_header.startswith("Bearer ") and not auth_header.startswith("Bearer qiq_"):
+        token = auth_header[7:]
     if not token:
         raise HTTPException(401, "Not authenticated")
     try:
@@ -180,11 +235,22 @@ async def register(body: RegisterIn, response: Response):
         "password_hash": hash_password(body.password),
         "name": body.name,
         "company": body.company or "",
-        "role": "user",
+        "role": "owner",
+        "plan": "free",
+        "trial_started_at": now_iso(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     res = await db.users.insert_one(doc)
     uid = str(res.inserted_id)
+    # Each new user owns a single-member organization by default.
+    org_res = await db.organizations.insert_one({
+        "owner_id": uid,
+        "name": doc["company"] or doc["name"] + "'s workspace",
+        "members": [{"user_id": uid, "role": "owner", "email": email, "joined_at": now_iso()}],
+        "created_at": now_iso(),
+    })
+    org_id = str(org_res.inserted_id)
+    await db.users.update_one({"_id": res.inserted_id}, {"$set": {"org_id": org_id}})
     # Seed default Customer Support agent for new user
     await db.agents.insert_one({
         "user_id": uid,
@@ -261,6 +327,8 @@ async def list_agents(user: dict = Depends(get_current_user)):
 
 @api.post("/agents")
 async def create_agent(body: AgentIn, user: dict = Depends(get_current_user)):
+    if not is_active(user):
+        raise HTTPException(402, "Your trial has ended. Upgrade to a paid plan to add more agents.")
     doc = body.model_dump()
     doc.update({
         "user_id": user["id"],
@@ -272,6 +340,7 @@ async def create_agent(body: AgentIn, user: dict = Depends(get_current_user)):
     res = await db.agents.insert_one(doc)
     doc["id"] = str(res.inserted_id)
     doc.pop("_id", None)
+    await audit_log(user["id"], "agent.create", "agent", doc["id"], {"name": doc["name"]})
     return doc
 
 @api.get("/agents/{agent_id}")
@@ -865,6 +934,8 @@ async def billing_me(user: dict = Depends(get_current_user)):
         "plan": user.get("plan", "free"),
         "plan_activated_at": user.get("plan_activated_at"),
         "available_plans": [{"id": k, **v} for k, v in BILLING_PLANS.items()],
+        "trial_days_remaining": trial_days_remaining(user),
+        "is_active": is_active(user),
     }
 
 # Stripe webhook (no auth — Stripe-signed)
@@ -1097,6 +1168,270 @@ async def delete_conversation(conv_id: str, user: dict = Depends(get_current_use
         raise HTTPException(404, "Conversation not found")
     return {"ok": True}
 
+# ---------------- Industry Templates ----------------
+INDUSTRY_TEMPLATES = {
+    "hvac": {
+        "name": "HVAC Workforce",
+        "tagline": "Heating, cooling, and customer love — automated.",
+        "company_profile": {
+            "audience": "Residential and light-commercial HVAC customers.",
+            "services": "Installation, repair, maintenance contracts, indoor air quality.",
+            "pricing": "$99 service-call fee. Quotes free on installs.",
+            "policies": "Same-day service in metro. 30-day workmanship warranty. After-hours +50%.",
+            "brand_voice": "Friendly, plain-English, no upsell pressure.",
+        },
+        "agents": [
+            {"name": "HVAC Service Concierge", "category": "Customer Service", "icon": "Headphones",
+             "description": "Books service calls and answers customer questions.",
+             "instructions": "You are an HVAC service concierge. Always ask for the customer's ZIP, equipment make/model, and the symptom in plain English. Quote the $99 service-call fee, then collect a preferred 4-hour window. Escalate emergencies (no heat in winter, no AC over 95F) to dispatcher immediately."},
+            {"name": "HVAC Sales Specialist", "category": "Sales", "icon": "TrendingUp",
+             "description": "Qualifies installation leads and books estimates.",
+             "instructions": "You are an HVAC sales specialist. Qualify install leads (age of existing system, square footage, fuel type, budget range). Book a free in-home estimate. Push high-SEER value when budget allows."},
+            {"name": "HVAC Dispatch", "category": "Operations", "icon": "Cog",
+             "description": "Routes service calls to technicians and rebalances the schedule.",
+             "instructions": "You are an HVAC dispatcher. When given a ticket, identify the nearest available certified tech and the next 4-hour window. Surface conflicts. Always confirm parts on the truck before promising same-day."},
+        ],
+    },
+    "plumbing": {
+        "name": "Plumbing Workforce",
+        "tagline": "From drips to disasters — handled.",
+        "company_profile": {
+            "audience": "Homeowners and property managers in our service area.",
+            "services": "Drain cleaning, leak repair, water heater install/repair, repipe, sewer line.",
+            "pricing": "$79 diagnostic fee, waived on accepted work. Flat-rate book.",
+            "policies": "24/7 emergency. 90-day repair warranty.",
+            "brand_voice": "Confident, calm, never alarmist.",
+        },
+        "agents": [
+            {"name": "Plumbing Triage", "category": "Customer Service", "icon": "Headphones",
+             "description": "Triages plumbing emergencies and books regular service.",
+             "instructions": "You are a plumbing triage agent. First determine emergency vs scheduled (active leak/sewer back-up = emergency). Capture address, severity, photos if available. Book accordingly and quote the diagnostic fee."},
+            {"name": "Plumbing Estimator", "category": "Sales", "icon": "TrendingUp",
+             "description": "Books in-home estimates for repipe / water heater / sewer line jobs.",
+             "instructions": "You are a plumbing estimator. Confirm scope (repipe / WH replacement / sewer line). Ask about home age, materials, water pressure issues. Book a 60-minute free in-home estimate."},
+        ],
+    },
+    "auto": {
+        "name": "Auto Repair Workforce",
+        "tagline": "From the front desk to the bay — automated.",
+        "company_profile": {
+            "audience": "Local drivers needing scheduled maintenance and repair.",
+            "services": "Oil change, brakes, suspension, diagnostics, A/C, transmission.",
+            "pricing": "Free diagnostic with any repair. $99/hr labor.",
+            "policies": "2-year/24k parts-and-labor warranty. ASE-certified techs.",
+            "brand_voice": "No-jargon, transparent estimates, photos with every recommendation.",
+        },
+        "agents": [
+            {"name": "Service Advisor", "category": "Customer Service", "icon": "Headphones",
+             "description": "Books appointments and explains repairs in plain English.",
+             "instructions": "You are an auto service advisor. Capture year/make/model/mileage and the symptom. Explain what a likely diagnosis would involve and quote the diagnostic policy. Book an appointment in the next 3 business days."},
+            {"name": "Parts Lookup Agent", "category": "Operations", "icon": "Cog",
+             "description": "Confirms part availability before promising same-day work.",
+             "instructions": "You are an auto parts lookup agent. Given year/make/model/VIN-last-6, identify required parts and tell the user whether they are on-shelf, next-day, or special-order."},
+        ],
+    },
+    "law": {
+        "name": "Law Firm Workforce",
+        "tagline": "Intake, triage, and follow-up — without billable time.",
+        "company_profile": {
+            "audience": "Individuals and small businesses with new matters.",
+            "services": "Family, estate planning, personal injury, small business formation.",
+            "pricing": "Initial consult $250 (credited against retainer if engaged).",
+            "policies": "Conflict check before any case discussion. No legal advice over chat — schedule a consult.",
+            "brand_voice": "Professional, warm, careful with legal disclaimers.",
+        },
+        "agents": [
+            {"name": "Client Intake Specialist", "category": "Customer Service", "icon": "Headphones",
+             "description": "Runs new-matter intake and books initial consults.",
+             "instructions": "You are a legal client intake specialist. Run a conflict check (opposing party name, jurisdiction). Capture matter type, urgency, and a one-paragraph summary. Never give legal advice. Book a paid initial consult."},
+            {"name": "Legal Assistant", "category": "Legal", "icon": "Scale",
+             "description": "Summarizes documents and answers process FAQs.",
+             "instructions": "You are a paralegal-style assistant. Summarize contracts in plain English, flag risk clauses, and explain process timelines. Always add: 'This is general information, not legal advice.'"},
+        ],
+    },
+    "real_estate": {
+        "name": "Real Estate Workforce",
+        "tagline": "Lead capture, listing inquiries, and showings — covered.",
+        "company_profile": {
+            "audience": "Buyers and sellers in our local MLS area.",
+            "services": "Residential listings, buyer representation, rentals, investment properties.",
+            "pricing": "Standard 2.5% listing-side commission, negotiable on dual representation.",
+            "policies": "All offers must be in writing. Showings booked 2 hours minimum in advance.",
+            "brand_voice": "Knowledgeable, neighborhood-savvy, never pushy.",
+        },
+        "agents": [
+            {"name": "Listing Inquiry Agent", "category": "Sales", "icon": "TrendingUp",
+             "description": "Captures buyer leads and books showings.",
+             "instructions": "You are a real estate listing inquiry agent. Qualify buyer (pre-approved? budget? must-have features? timeline?). Book a showing for an active listing in our area."},
+            {"name": "Seller Concierge", "category": "Customer Service", "icon": "Headphones",
+             "description": "Walks sellers through CMA, pricing, and listing prep.",
+             "instructions": "You are a seller concierge. Capture the address, condition, and seller's timeline. Offer a free CMA (comparative market analysis) and book a listing appointment."},
+        ],
+    },
+}
+
+@api.get("/industries")
+async def list_industries():
+    return [{"id": k, "name": v["name"], "tagline": v["tagline"], "agent_count": len(v["agents"])} for k, v in INDUSTRY_TEMPLATES.items()]
+
+@api.post("/industries/{industry_id}/install")
+async def install_industry(industry_id: str, user: dict = Depends(get_current_user)):
+    tmpl = INDUSTRY_TEMPLATES.get(industry_id)
+    if not tmpl:
+        raise HTTPException(404, "Industry not found")
+    if not is_active(user):
+        raise HTTPException(402, "Trial ended — upgrade to install an industry workforce.")
+
+    # Merge industry company profile (don't clobber existing values).
+    existing = await db.company_profiles.find_one({"user_id": user["id"]}) or {}
+    merged = {**tmpl["company_profile"]}
+    for k, v in existing.items():
+        if k in merged and (v or "").strip():
+            merged[k] = v
+    merged["user_id"] = user["id"]
+    merged["updated_at"] = now_iso()
+    await db.company_profiles.update_one(
+        {"user_id": user["id"]}, {"$set": merged, "$setOnInsert": {"created_at": now_iso()}}, upsert=True
+    )
+
+    # Create the agents.
+    created_ids = []
+    for a in tmpl["agents"]:
+        res = await db.agents.insert_one({
+            "user_id": user["id"],
+            "name": a["name"], "role": a["name"],
+            "category": a["category"], "icon": a["icon"],
+            "description": a["description"], "instructions": a["instructions"],
+            "status": "active", "knowledge_text": "", "knowledge_files": [],
+            "created_at": now_iso(),
+        })
+        created_ids.append(str(res.inserted_id))
+
+    await audit_log(user["id"], "industry.install", "industry", industry_id, {"agents_created": len(created_ids)})
+    return {"ok": True, "industry_id": industry_id, "agent_ids": created_ids, "agents_created": len(created_ids)}
+
+# ---------------- Team / Org ----------------
+class InviteIn(BaseModel):
+    email: EmailStr
+    role: str = "employee"
+
+@api.get("/team")
+async def get_team(user: dict = Depends(get_current_user)):
+    org_id = user.get("org_id")
+    if not org_id:
+        return {"members": [], "org_id": None}
+    org = await db.organizations.find_one({"_id": to_object_id(org_id, "org id")})
+    if not org:
+        return {"members": [], "org_id": org_id}
+    return {"org_id": org_id, "name": org.get("name"), "members": org.get("members", [])}
+
+@api.post("/team/invite")
+async def invite_member(body: InviteIn, user: dict = Depends(get_current_user)):
+    if user.get("role") not in ("owner", "admin"):
+        raise HTTPException(403, "Only owners or admins can invite")
+    if body.role not in TEAM_ROLES or body.role == "owner":
+        raise HTTPException(400, f"Role must be one of: admin, manager, employee")
+    org_id = user.get("org_id")
+    if not org_id:
+        raise HTTPException(400, "No organization on this account")
+    email = body.email.lower()
+    org = await db.organizations.find_one({"_id": to_object_id(org_id, "org id")})
+    if not org:
+        raise HTTPException(404, "Org not found")
+    if any(m.get("email") == email for m in org.get("members", [])):
+        raise HTTPException(400, "Already a member")
+    invite_token = secrets.token_urlsafe(24)
+    new_member = {"email": email, "role": body.role, "invited_at": now_iso(),
+                  "invited_by": user["id"], "status": "pending", "invite_token": invite_token}
+    await db.organizations.update_one(
+        {"_id": to_object_id(org_id, "org id")},
+        {"$push": {"members": new_member}},
+    )
+    await audit_log(user["id"], "team.invite", "user", email, {"role": body.role})
+    return {"ok": True, "email": email, "role": body.role, "invite_token": invite_token}
+
+@api.delete("/team/{email}")
+async def remove_member(email: str, user: dict = Depends(get_current_user)):
+    if user.get("role") not in ("owner", "admin"):
+        raise HTTPException(403, "Only owners or admins can remove")
+    if email.lower() == user["email"]:
+        raise HTTPException(400, "Cannot remove yourself")
+    org_id = user.get("org_id")
+    if not org_id:
+        raise HTTPException(400, "No organization")
+    await db.organizations.update_one(
+        {"_id": to_object_id(org_id, "org id")},
+        {"$pull": {"members": {"email": email.lower()}}},
+    )
+    await audit_log(user["id"], "team.remove", "user", email)
+    return {"ok": True}
+
+# ---------------- Audit Logs ----------------
+@api.get("/audit-logs")
+async def list_audit_logs(action: Optional[str] = None, target_type: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query: dict = {"user_id": user["id"]}
+    if action:
+        query["action"] = action
+    if target_type:
+        query["target_type"] = target_type
+    cursor = db.audit_logs.find(query).sort("ts", -1).limit(500)
+    out = []
+    async for log in cursor:
+        log["id"] = str(log.pop("_id"))
+        log.pop("ts_dt", None)
+        out.append(log)
+    return {"logs": out, "count": len(out)}
+
+# ---------------- API Keys ----------------
+class ApiKeyCreateIn(BaseModel):
+    name: str
+
+@api.post("/keys")
+async def create_api_key(body: ApiKeyCreateIn, user: dict = Depends(get_current_user)):
+    if user.get("auth_via") == "api_key":
+        raise HTTPException(403, "Cannot create API keys with an API key — use a session")
+    import hashlib
+    raw = "qiq_" + secrets.token_urlsafe(32)
+    sha = hashlib.sha256(raw.encode()).hexdigest()
+    doc = {
+        "user_id": user["id"],
+        "name": body.name or "Unnamed key",
+        "key_sha256": sha,
+        "key_prefix": raw[:11],  # qiq_ + 7 chars for display
+        "active": True,
+        "created_at": now_iso(),
+        "last_used_at": None,
+    }
+    res = await db.api_keys.insert_one(doc)
+    await audit_log(user["id"], "api_key.create", "api_key", str(res.inserted_id), {"name": doc["name"]})
+    # Return the raw key ONCE — never readable again.
+    return {"id": str(res.inserted_id), "name": doc["name"], "key": raw, "prefix": doc["key_prefix"], "created_at": doc["created_at"]}
+
+@api.get("/keys")
+async def list_api_keys(user: dict = Depends(get_current_user)):
+    cursor = db.api_keys.find({"user_id": user["id"]}).sort("created_at", -1)
+    out = []
+    async for k in cursor:
+        out.append({
+            "id": str(k.pop("_id")),
+            "name": k.get("name"),
+            "prefix": k.get("key_prefix"),
+            "active": k.get("active", True),
+            "created_at": k.get("created_at"),
+            "last_used_at": k.get("last_used_at"),
+        })
+    return {"keys": out}
+
+@api.delete("/keys/{key_id}")
+async def revoke_api_key(key_id: str, user: dict = Depends(get_current_user)):
+    if user.get("auth_via") == "api_key":
+        raise HTTPException(403, "Cannot revoke keys with an API key — use a session")
+    result = await db.api_keys.delete_one({"_id": to_object_id(key_id, "key id"), "user_id": user["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Key not found")
+    await audit_log(user["id"], "api_key.revoke", "api_key", key_id)
+    return {"ok": True}
+
 @api.get("/")
 async def root():
     return {"service": "QuotientIQ API", "status": "ok"}
@@ -1136,6 +1471,10 @@ async def startup():
     except Exception:
         pass
     await db.embed_hits.create_index([("token", 1), ("visitor", 1)])
+    await db.audit_logs.create_index([("user_id", 1), ("ts", -1)])
+    await db.api_keys.create_index("key_sha256", unique=True)
+    await db.api_keys.create_index("user_id")
+    await db.organizations.create_index("owner_id")
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@quotientiq.com").lower()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")
@@ -1165,6 +1504,25 @@ async def startup():
         })
     elif not verify_password(admin_pw, existing["password_hash"]):
         await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_pw)}})
+
+    # Backfill: any user without an org_id gets a single-member organization.
+    async for u in db.users.find({"org_id": {"$exists": False}}):
+        uid = str(u["_id"])
+        existing_role = u.get("role") or "owner"
+        org_res = await db.organizations.insert_one({
+            "owner_id": uid,
+            "name": (u.get("company") or u.get("name", "Untitled")) + "'s workspace",
+            "members": [{"user_id": uid, "role": existing_role, "email": u["email"], "joined_at": now_iso()}],
+            "created_at": now_iso(),
+        })
+        await db.users.update_one(
+            {"_id": u["_id"]},
+            {"$set": {
+                "org_id": str(org_res.inserted_id),
+                "plan": u.get("plan", "free"),
+                "trial_started_at": u.get("trial_started_at", u.get("created_at", now_iso())),
+            }},
+        )
     logger.info("QuotientIQ ready.")
 
 @app.on_event("shutdown")

@@ -17,6 +17,9 @@ import Embed from "@/pages/Embed";
 import Conversations from "@/pages/Conversations";
 import CompanyProfile from "@/pages/CompanyProfile";
 import OrgChart from "@/pages/OrgChart";
+import Team from "@/pages/Team";
+import AuditLogs from "@/pages/AuditLogs";
+import Developer from "@/pages/Developer";
 
 function PublicOnly({ children }) {
   const { user, loading } = useAuth();
@@ -42,6 +45,9 @@ export default function App() {
           <Route path="/org" element={<Protected><OrgChart /></Protected>} />
           <Route path="/billing" element={<Protected><Billing /></Protected>} />
           <Route path="/conversations" element={<Protected><Conversations /></Protected>} />
+          <Route path="/team" element={<Protected><Team /></Protected>} />
+          <Route path="/audit" element={<Protected><AuditLogs /></Protected>} />
+          <Route path="/developer" element={<Protected><Developer /></Protected>} />
           <Route path="/embed/:token" element={<Embed />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

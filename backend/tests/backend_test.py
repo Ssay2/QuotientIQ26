@@ -899,3 +899,301 @@ class TestEmbedHitsTTL:
             assert ttl[0]["expireAfterSeconds"] == 3600, f"Expected TTL=3600, got {ttl[0]['expireAfterSeconds']}"
         finally:
             client.close()
+
+
+# ==================== V5 ====================
+
+INDUSTRY_IDS = ["hvac", "plumbing", "auto", "law", "real_estate"]
+
+
+def _mongo():
+    from pymongo import MongoClient
+    mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+    db_name = os.environ.get("DB_NAME", "quotientiq_db")
+    return MongoClient(mongo_url), db_name
+
+
+# -------- V5: Industry templates --------
+class TestIndustries:
+    def test_list_industries(self):
+        r = requests.get(f"{API}/industries")
+        assert r.status_code == 200, r.text
+        items = r.json()
+        assert isinstance(items, list)
+        ids = {i["id"] for i in items}
+        for required in INDUSTRY_IDS:
+            assert required in ids, f"Missing industry {required}; got {ids}"
+        for it in items:
+            for k in ("id", "name", "tagline", "agent_count"):
+                assert k in it, f"Industry {it.get('id')} missing {k}"
+            assert isinstance(it["agent_count"], int) and it["agent_count"] > 0
+
+    def test_install_hvac_creates_agents(self, fresh_user_client):
+        before = len(fresh_user_client.get(f"{API}/agents").json())
+        r = fresh_user_client.post(f"{API}/industries/hvac/install")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["ok"] is True
+        assert d["industry_id"] == "hvac"
+        assert d["agents_created"] >= 1
+        assert len(d["agent_ids"]) == d["agents_created"]
+        after = len(fresh_user_client.get(f"{API}/agents").json())
+        assert after - before == d["agents_created"]
+
+    def test_install_unknown_industry_404(self, fresh_user_client):
+        r = fresh_user_client.post(f"{API}/industries/nonexistent_xyz/install")
+        assert r.status_code == 404
+
+    def test_install_merges_profile_without_clobbering(self, fresh_user_client):
+        # Pre-set a custom company_name
+        fresh_user_client.put(f"{API}/company-profile", json={
+            "company_name": "MyExistingCo", "audience": "", "products": "",
+            "services": "", "pricing": "", "brand_voice": "", "policies": ""
+        })
+        r = fresh_user_client.post(f"{API}/industries/plumbing/install")
+        assert r.status_code == 200
+        prof = fresh_user_client.get(f"{API}/company-profile").json()
+        assert prof["company_name"] == "MyExistingCo", "Existing non-empty field was clobbered"
+        # An empty field should now be filled from template
+        assert (prof.get("audience") or "").strip(), "Empty field should be filled by template"
+
+
+# -------- V5: Trial / Billing --------
+class TestTrial:
+    def test_new_user_has_14_day_trial(self, fresh_user_client):
+        r = fresh_user_client.get(f"{API}/billing/me")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["plan"] == "free"
+        assert "trial_days_remaining" in d
+        assert 12 <= d["trial_days_remaining"] <= 14
+        assert d.get("is_active") is True
+
+    def test_paid_plan_returns_9999(self, fresh_user_client):
+        client, db_name = _mongo()
+        try:
+            client[db_name].users.update_one(
+                {"email": fresh_user_client.user_email}, {"$set": {"plan": "starter"}}
+            )
+            d = fresh_user_client.get(f"{API}/billing/me").json()
+            assert d["plan"] == "starter"
+            assert d["trial_days_remaining"] == 9999
+            assert d["is_active"] is True
+        finally:
+            client[db_name].users.update_one(
+                {"email": fresh_user_client.user_email}, {"$set": {"plan": "free"}}
+            )
+            client.close()
+
+
+# -------- V5: Paywall enforcement --------
+class TestPaywall:
+    def test_trial_expired_blocks_then_paid_unblocks(self):
+        # Create fresh user
+        s = requests.Session()
+        email = f"paywall_{uuid.uuid4().hex[:8]}@quotientiq.com"
+        rr = s.post(f"{API}/auth/register", json={
+            "email": email, "password": "Test1234!", "name": "PW", "company": "Co"
+        })
+        assert rr.status_code == 200, rr.text
+        token = rr.json()["access_token"]
+        s.headers["Authorization"] = f"Bearer {token}"
+
+        # Sanity: works while trial is active
+        r = s.post(f"{API}/agents", json={"name": "TEST_PW_OK", "role": "x"})
+        assert r.status_code == 200
+        s.delete(f"{API}/agents/{r.json()['id']}")
+
+        # Expire the trial by setting trial_started_at to 20 days ago
+        client, db_name = _mongo()
+        try:
+            from datetime import datetime, timedelta, timezone
+            past = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
+            client[db_name].users.update_one(
+                {"email": email}, {"$set": {"trial_started_at": past, "plan": "free"}}
+            )
+
+            # Verify billing reflects expiry
+            d = s.get(f"{API}/billing/me").json()
+            assert d.get("is_active") is False, f"Expected is_active=False after expiry: {d}"
+
+            # Agent create blocked
+            r = s.post(f"{API}/agents", json={"name": "TEST_blocked", "role": "x"})
+            assert r.status_code == 402, f"Expected 402, got {r.status_code} {r.text}"
+
+            # Industry install blocked
+            r = s.post(f"{API}/industries/hvac/install")
+            assert r.status_code == 402, f"Expected 402 on industry install, got {r.status_code} {r.text}"
+
+            # Simulate payment: plan='starter'
+            client[db_name].users.update_one({"email": email}, {"$set": {"plan": "starter"}})
+
+            # Now agent create works
+            r = s.post(f"{API}/agents", json={"name": "TEST_paid", "role": "x"})
+            assert r.status_code == 200, r.text
+            s.delete(f"{API}/agents/{r.json()['id']}")
+
+            # Industry install works
+            r = s.post(f"{API}/industries/auto/install")
+            assert r.status_code == 200, r.text
+        finally:
+            client.close()
+
+
+# -------- V5: Team --------
+class TestTeam:
+    def test_get_team_for_fresh_user(self, fresh_user_client):
+        r = fresh_user_client.get(f"{API}/team")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert "members" in d
+        # Fresh user is owner of their org with themselves as a member
+        emails = [m.get("email") for m in d["members"]]
+        assert fresh_user_client.user_email in emails
+
+    def test_invite_member_success_and_persist(self, admin_client):
+        invitee = f"invite_{uuid.uuid4().hex[:8]}@example.com"
+        try:
+            r = admin_client.post(f"{API}/team/invite", json={"email": invitee, "role": "employee"})
+            assert r.status_code == 200, r.text
+            d = r.json()
+            assert d["email"] == invitee
+            assert d["role"] == "employee"
+            # Verify in /team
+            team = admin_client.get(f"{API}/team").json()
+            emails = [m["email"] for m in team["members"]]
+            assert invitee in emails
+        finally:
+            admin_client.delete(f"{API}/team/{invitee}")
+
+    def test_invite_owner_role_rejected(self, admin_client):
+        r = admin_client.post(f"{API}/team/invite", json={
+            "email": f"owner_{uuid.uuid4().hex[:6]}@x.com", "role": "owner"
+        })
+        assert r.status_code == 400
+
+    def test_invite_invalid_role_rejected(self, admin_client):
+        r = admin_client.post(f"{API}/team/invite", json={
+            "email": f"bad_{uuid.uuid4().hex[:6]}@x.com", "role": "superuser"
+        })
+        assert r.status_code == 400
+
+    def test_invite_existing_member_rejected(self, admin_client):
+        invitee = f"dup_{uuid.uuid4().hex[:8]}@example.com"
+        try:
+            r1 = admin_client.post(f"{API}/team/invite", json={"email": invitee, "role": "employee"})
+            assert r1.status_code == 200, r1.text
+            r2 = admin_client.post(f"{API}/team/invite", json={"email": invitee, "role": "manager"})
+            assert r2.status_code == 400
+        finally:
+            admin_client.delete(f"{API}/team/{invitee}")
+
+    def test_remove_member(self, admin_client):
+        invitee = f"rem_{uuid.uuid4().hex[:8]}@example.com"
+        r = admin_client.post(f"{API}/team/invite", json={"email": invitee, "role": "employee"})
+        assert r.status_code == 200
+        r = admin_client.delete(f"{API}/team/{invitee}")
+        assert r.status_code == 200
+        team = admin_client.get(f"{API}/team").json()
+        assert invitee not in [m["email"] for m in team["members"]]
+
+    def test_non_admin_cannot_invite(self, fresh_user_client):
+        # Force role to employee for this user
+        client, db_name = _mongo()
+        try:
+            client[db_name].users.update_one(
+                {"email": fresh_user_client.user_email}, {"$set": {"role": "employee"}}
+            )
+            r = fresh_user_client.post(f"{API}/team/invite", json={
+                "email": f"x_{uuid.uuid4().hex[:6]}@x.com", "role": "employee"
+            })
+            assert r.status_code == 403, r.text
+            r = fresh_user_client.delete(f"{API}/team/some@x.com")
+            assert r.status_code == 403
+        finally:
+            client[db_name].users.update_one(
+                {"email": fresh_user_client.user_email}, {"$set": {"role": "owner"}}
+            )
+            client.close()
+
+
+# -------- V5: Audit logs --------
+class TestAuditLogs:
+    def test_audit_log_records_actions(self, fresh_user_client):
+        # Perform actions that should write audit logs
+        a = fresh_user_client.post(f"{API}/agents", json={"name": "TEST_audit", "role": "x"}).json()
+        # Industry install
+        fresh_user_client.post(f"{API}/industries/hvac/install")
+
+        r = fresh_user_client.get(f"{API}/audit-logs")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert "logs" in d
+        actions = [l["action"] for l in d["logs"]]
+        assert "agent.create" in actions
+        assert "industry.install" in actions
+        # Sorted desc by ts
+        ts_list = [l.get("ts") for l in d["logs"] if l.get("ts")]
+        assert ts_list == sorted(ts_list, reverse=True)
+        # Cleanup
+        fresh_user_client.delete(f"{API}/agents/{a['id']}")
+
+    def test_audit_log_action_filter(self, fresh_user_client):
+        fresh_user_client.post(f"{API}/agents", json={"name": "TEST_aud2", "role": "x"})
+        r = fresh_user_client.get(f"{API}/audit-logs", params={"action": "agent.create"})
+        assert r.status_code == 200
+        for l in r.json()["logs"]:
+            assert l["action"] == "agent.create"
+
+
+# -------- V5: API keys --------
+class TestApiKeys:
+    def test_create_list_use_revoke_flow(self, fresh_user_client):
+        # CREATE
+        r = fresh_user_client.post(f"{API}/keys", json={"name": "test-key-1"})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["key"].startswith("qiq_")
+        assert d["prefix"].startswith("qiq_")
+        key_id = d["id"]
+        raw = d["key"]
+
+        # LIST - no raw key, only prefix
+        r = fresh_user_client.get(f"{API}/keys")
+        assert r.status_code == 200
+        keys = r.json()["keys"]
+        ours = [k for k in keys if k["id"] == key_id]
+        assert len(ours) == 1
+        assert "key" not in ours[0], "Raw key should not be in list response"
+        assert ours[0]["prefix"].startswith("qiq_")
+
+        # USE the key on protected endpoint (no other auth)
+        s = requests.Session()
+        s.headers["Authorization"] = f"Bearer {raw}"
+        r = s.get(f"{API}/agents")
+        assert r.status_code == 200, f"Valid API key should access /agents: {r.text}"
+
+        # Creating/revoking keys with API key auth → 403
+        r = s.post(f"{API}/keys", json={"name": "should-fail"})
+        assert r.status_code == 403
+        r = s.delete(f"{API}/keys/{key_id}")
+        assert r.status_code == 403
+
+        # REVOKE with session
+        r = fresh_user_client.delete(f"{API}/keys/{key_id}")
+        assert r.status_code == 200
+
+        # Revoked key → 401 on protected endpoint
+        r = s.get(f"{API}/agents")
+        assert r.status_code == 401, f"Revoked key should return 401, got {r.status_code}"
+
+    def test_nonexistent_key_returns_401(self):
+        s = requests.Session()
+        s.headers["Authorization"] = "Bearer qiq_thiskeydoesnotexist_xyz_12345"
+        r = s.get(f"{API}/agents")
+        assert r.status_code == 401
+
+    def test_revoke_unknown_key_returns_404(self, fresh_user_client):
+        from bson import ObjectId
+        r = fresh_user_client.delete(f"{API}/keys/{ObjectId()}")
+        assert r.status_code == 404
