@@ -24,6 +24,15 @@ QuotientIQ — an Enterprise AI Employee Marketplace ("App Store for AI Employee
 - Per-user seeded support agent on registration
 - Backend regression test suite (18 tests)
 
+### V5 — shipped 2026-06-13
+- **Industry templates (Layer 33)**: 5 prebuilt workforces — HVAC, Plumbing, Auto Repair, Law Firm, Real Estate. One-click `POST /api/industries/{id}/install` creates 2-3 industry-tuned agents AND merges a starter Company Profile (without clobbering existing fields). Idempotent (returns 409 if already installed unless `?force=true`).
+- **Trial paywall (Layer 20 hardening)**: 14-day trial tracked via `trial_started_at`; `is_active(user)` gates agent creation + industry install (returns HTTP 402 when expired). `/api/billing/me` reports `trial_days_remaining` + `is_active`. Top-of-app `TrialBanner` shows during last 7 days, expired in destructive red.
+- **Team roles & invites (Layer 22)**: Each user owns an `organization` with `members[]`. Roles: owner, admin, manager, employee. `POST /api/team/invite` mints an invite_token; `GET /api/team` returns roster; `DELETE /api/team/{email}` removes (owners + admins only). Per-org RBAC enforced.
+- **Audit logs (Layer 22)**: `audit_log()` helper writes to `db.audit_logs` for every important action (agent.create, industry.install, team.invite/remove, api_key.create/revoke). `/audit` page renders the trail with filter.
+- **API keys (Layer 23)**: `/developer` page mints `qiq_<32-byte>` keys (raw shown ONCE). Authorization: `Bearer qiq_xxx` resolves via SHA256 lookup in `db.api_keys`. Per-key `last_used_at` tracking. Revoke = hard delete (irrecoverable). Session-only for create/revoke (cannot manage keys with a key).
+- Backend tests expanded to 66 (100% passing).
+- Sidebar reorganized into main + Workspace sections (Team / Billing / Audit / Developer).
+
 ### V4 — shipped 2026-06-13
 - **Conversations explorer**: `/conversations` page lists all threads (internal + embedded) with agent name, customer/visitor, last message preview, msg count, timestamp, EMBED badge for embed-sourced threads. Filters: by agent, by source (internal/embed). Client-side search. Per-row Export (JSON download) + Delete actions. Backend: `GET /api/conversations` (with agent_id/source filters, joins agent metadata, computes message_count via aggregate), `GET /api/conversations/{id}/export`, `DELETE /api/conversations/{id}`.
 - **Markdown rendering** in chat: assistant messages now render `react-markdown + remark-gfm` (tables, lists, code blocks, bold/italic, links, headings, blockquotes, hr). Active in both authenticated `/chat` and public `/embed/:token`. User messages stay plain text.

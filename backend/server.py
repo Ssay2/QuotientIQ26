@@ -1275,12 +1275,24 @@ async def list_industries():
     return [{"id": k, "name": v["name"], "tagline": v["tagline"], "agent_count": len(v["agents"])} for k, v in INDUSTRY_TEMPLATES.items()]
 
 @api.post("/industries/{industry_id}/install")
-async def install_industry(industry_id: str, user: dict = Depends(get_current_user)):
+async def install_industry(industry_id: str, force: bool = False, user: dict = Depends(get_current_user)):
     tmpl = INDUSTRY_TEMPLATES.get(industry_id)
     if not tmpl:
         raise HTTPException(404, "Industry not found")
     if not is_active(user):
         raise HTTPException(402, "Trial ended — upgrade to install an industry workforce.")
+
+    # Idempotency check — don't install the same workforce twice unless explicitly forced.
+    expected_names = {a["name"] for a in tmpl["agents"]}
+    existing = await db.agents.find(
+        {"user_id": user["id"], "name": {"$in": list(expected_names)}}, {"name": 1}
+    ).to_list(20)
+    if existing and not force:
+        existing_names = sorted({a["name"] for a in existing})
+        raise HTTPException(
+            409,
+            f"This workforce is already installed ({len(existing_names)} matching agents). Pass ?force=true to install a duplicate set.",
+        )
 
     # Merge industry company profile (don't clobber existing values).
     existing = await db.company_profiles.find_one({"user_id": user["id"]}) or {}
@@ -1354,16 +1366,17 @@ async def invite_member(body: InviteIn, user: dict = Depends(get_current_user)):
 async def remove_member(email: str, user: dict = Depends(get_current_user)):
     if user.get("role") not in ("owner", "admin"):
         raise HTTPException(403, "Only owners or admins can remove")
-    if email.lower() == user["email"]:
+    email_l = email.lower()
+    if email_l == user["email"]:
         raise HTTPException(400, "Cannot remove yourself")
     org_id = user.get("org_id")
     if not org_id:
         raise HTTPException(400, "No organization")
     await db.organizations.update_one(
         {"_id": to_object_id(org_id, "org id")},
-        {"$pull": {"members": {"email": email.lower()}}},
+        {"$pull": {"members": {"email": email_l}}},
     )
-    await audit_log(user["id"], "team.remove", "user", email)
+    await audit_log(user["id"], "team.remove", "user", email_l)
     return {"ok": True}
 
 # ---------------- Audit Logs ----------------
