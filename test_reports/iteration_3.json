@@ -1,0 +1,51 @@
+{
+  "summary": "QuotientIQ V3 testing complete. Added 11 new V3 tests (lockout x1, billing x5, parse_delegations x2, multi-agent delegation x1, embed x1, widget.js x1) on top of the 31 V2 regression tests. Result: 41/42 pytest pass. Frontend /billing renders all 3 plan cards + testids; clicking subscribe-starter calls POST /api/billing/checkout and returns a valid Stripe checkout URL (verified live: https://checkout.stripe.com/c/pay/cs_test_...). /chat side panel exposes the EmbedSection with snippet + copy/rotate/disable testids. /embed/{token} public page (no auth) loads agent name, sends message, and receives a reply. /widget.js served by frontend public/ returns 200 with an IIFE. Brute-force lockout works correctly: 5x 401 then 429, blocks even correct password, success clears the counter. ONE BACKEND BUG FOUND: /api/agents/{id}/chat-sync does NOT execute or stitch [DELEGATE: ...] markers — only the streaming /chat (event_stream) does. The V3 spec explicitly required delegation to work through chat-sync.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/agents/{id}/chat-sync",
+        "issue": "Does NOT run _parse_delegations / _run_delegation. The chat-sync endpoint at server.py:616-637 returns the raw LLM output (including the literal [DELEGATE: ...] marker) without parsing or stitching teammate replies. Only the streaming event_stream (lines 579-610) executes delegation. The V3 spec required delegation to be visible via chat-sync. Repro: install Sales+Recruiter agents, instruct Sales to always emit [DELEGATE: HR Person | <q>], then POST /api/agents/{sales_id}/chat-sync with 'how many vacation days do new hires get?' — reply contains the literal marker but no 'Asked HR Person' block.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "FIX: In /api/agents/{id}/chat-sync (server.py:616-637), after the streaming loop completes call `cleaned, dels = _parse_delegations(full)`, then for each d in dels: `result = await _run_delegation(user['id'], agent_id, d['agent'], d['question'])` and append a `\\n\\n— **Asked {result['agent']}**: {d['question']}\\n{result['reply']}` block (mirrors event_stream lines 594-602). Return `cleaned + delegation_blocks` instead of raw `full`. This will make the V3 multi-agent delegation feature work end-to-end and pass test_delegation_stitched_in_chat.",
+    "(Optional, low priority) server.py is now 1057 lines — strongly recommend splitting into routers (auth, agents, knowledge, chat, marketplace, analytics, profile, org, billing, embed) before further growth.",
+    "(Optional) The webhook endpoint at /api/webhook/stripe swallows all errors and returns 200 — consider returning a real 400 for invalid signatures so Stripe retries cleanly.",
+    "(Optional) BILLING_PLANS has no 'enterprise' entry (intentional — enterprise is contact-sales). Confirm there is no future code path that does BILLING_PLANS[plan_id] without the 400 guard."
+  ],
+  "critical_code_review_comments": [
+    "chat-sync vs event_stream divergence: two duplicated LLM-streaming code paths (server.py 579-610 and 616-637). Only one runs delegations; only one parses markers. Should be unified into a helper like `_run_agent_chat(agent, message, conv_id) -> (cleaned_reply, delegations)` reused by both.",
+    "Embed chat endpoint (line 954-992) does NOT rate-limit by visitor_id — public endpoint open to abuse / cost explosion. Add per-token + per-visitor rate limiting before production.",
+    "embed_chat parses delegations via _parse_delegations but throws away the result list (line 983, `cleaned, _ = ...`). For consistency with the streaming path, either execute them or document the intentional skip.",
+    "billing_status uses request.base_url to construct the webhook_url which may be the internal :8001 host — Stripe expects a public URL. The /billing/checkout path uses body.origin_url (correct). Either always use the env-configured public URL or derive it consistently from a single helper.",
+    "STRIPE_API_KEY=sk_test_emergent is read once at module load; if the env var rotates the server won't pick it up without a restart. Minor.",
+    "login_attempts collection has a non-TTL index. Rows are never expired/purged, only deleted on successful login. Add a TTL index on ts (e.g., expireAfterSeconds=900) so the collection doesn't grow unbounded under credential-stuffing storms.",
+    "CORS still allow_origins=['*'] with allow_credentials=True — preview-friendly but invalid per CORS spec and risky in prod.",
+    "Embed widget.js exposes the embed_token in the HTML data attribute — that's by design (it's a public chat token) but should be documented; rotation flow (embed-rotate) is the mitigation."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py (added 11 V3 tests across 7 new classes; minor cleanup helper for login_attempts that reads /app/backend/.env)"
+  ],
+  "success_rate": {
+    "backend": "97.6% (41/42) — only failure is the delegation-via-chat-sync backend bug",
+    "frontend": "100% on critical V3 flows (billing, embed snippet, public /embed/{token} chat, widget.js)"
+  },
+  "test_credentials": "Admin admin@quotientiq.com / admin123 still works. Brute-force test uses unique throwaway emails (lockouttest_<uuid8>@example.com) and cleans up login_attempts after.",
+  "seed_data_creation": "Each test run creates a few fresh users test_<uuid8>@quotientiq.com (harmless). The brute-force test self-cleans its login_attempts row. The admin's QuotientIQ Demo Support Agent now has an active embed_token from the frontend smoke test — main agent may rotate/disable if desired.",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend regression suite now has 42 tests in /app/backend/tests/backend_test.py. Run: ADMIN_PASSWORD=admin123 ADMIN_EMAIL=admin@quotientiq.com REACT_APP_BACKEND_URL=https://quotient-mvp.preview.emergentagent.com pytest /app/backend/tests/backend_test.py -v. The single failing test TestMultiAgentDelegation::test_delegation_stitched_in_chat will pass once chat-sync is patched to call _parse_delegations + _run_delegation and append the 'Asked <agent>' blocks (mirror event_stream lines 594-602). Stripe live test mode is working: cs_test_* URLs are being generated successfully. The /widget.js loader is served correctly by the frontend static directory.",
+  "rca of the issue": "Multi-agent delegation in chat-sync — RCA: chat_sync handler (server.py L616-637) was implemented before the delegation helpers existed (L879-904) and was never updated to invoke them. The streaming endpoint event_stream (L579-610) correctly runs delegations, but the JSON sync endpoint does not. Repro: see action_items[0]. Fix: 5-line patch inside chat_sync after the streaming loop ends — call _parse_delegations(full), iterate delegations to call _run_delegation, append stitched blocks, return cleaned+blocks. Mitigation until fixed: clients can use the streaming /chat endpoint instead."
+}

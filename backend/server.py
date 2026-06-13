@@ -26,6 +26,11 @@ from bs4 import BeautifulSoup
 import requests
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+from emergentintegrations.payments.stripe.checkout import (
+    StripeCheckout,
+    CheckoutSessionRequest,
+    CheckoutStatusResponse,
+)
 
 # ---------------- DB ----------------
 mongo_url = os.environ['MONGO_URL']
@@ -33,7 +38,18 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 EMERGENT_LLM_KEY = os.environ['EMERGENT_LLM_KEY']
+STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY', '')
 JWT_ALGORITHM = "HS256"
+
+# Backend-controlled billing packages. NEVER trust prices from the client.
+BILLING_PLANS = {
+    "starter": {"name": "Starter", "amount": 99.0, "currency": "usd"},
+    "professional": {"name": "Professional", "amount": 299.0, "currency": "usd"},
+}
+
+# Brute-force protection config
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 900  # 15 minutes
 
 # ---------------- Validation Helpers ----------------
 def to_object_id(value: str, label: str = "id") -> ObjectId:
@@ -184,16 +200,35 @@ async def register(body: RegisterIn, response: Response):
     return {"id": uid, "email": email, "name": body.name, "company": doc["company"], "role": "user", "access_token": access}
 
 @api.post("/auth/login")
-async def login(body: LoginIn, response: Response):
+async def login(body: LoginIn, request: Request, response: Response):
     email = body.email.lower()
+    # Identifier is email-only: rate-limit per account to defend against credential stuffing.
+    # (Per-IP rate limiting belongs at the ingress/edge layer.)
+    identifier = f"email:{email}"
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=LOGIN_WINDOW_SECONDS)
+    cutoff_iso = cutoff.isoformat()
+
+    # Check current lockout state.
+    recent = await db.login_attempts.count_documents({
+        "identifier": identifier,
+        "ts": {"$gte": cutoff_iso},
+    })
+    if recent >= LOGIN_MAX_ATTEMPTS:
+        raise HTTPException(429, f"Too many failed attempts. Try again in {LOGIN_WINDOW_SECONDS // 60} minutes.")
+
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(body.password, user["password_hash"]):
+        await db.login_attempts.insert_one({"identifier": identifier, "ts": now_iso()})
         raise HTTPException(401, "Invalid email or password")
+
+    # Success — clear attempts.
+    await db.login_attempts.delete_many({"identifier": identifier})
+
     uid = str(user["_id"])
     access = create_access_token(uid, email)
     refresh = create_refresh_token(uid)
     set_auth_cookies(response, access, refresh)
-    return {"id": uid, "email": email, "name": user.get("name", ""), "company": user.get("company", ""), "role": user.get("role", "user"), "access_token": access}
+    return {"id": uid, "email": email, "name": user.get("name", ""), "company": user.get("company", ""), "role": user.get("role", "user"), "plan": user.get("plan", "free"), "access_token": access}
 
 @api.post("/auth/logout")
 async def logout(response: Response):
@@ -476,9 +511,13 @@ async def _build_system_message_full(agent: dict) -> str:
     team = await _get_team_context(agent["user_id"], str(agent["_id"]))
     if team:
         parts.append(
-            "--- YOUR TEAM ---\nYou collaborate with the following AI teammates. If a question is outside your scope, suggest the user talk to the right teammate by name:\n"
+            "--- YOUR TEAM ---\n"
+            "You collaborate with the following AI teammates:\n"
             + team
-            + "\n--- END TEAM ---"
+            + "\n\nIf a user asks something that a teammate is better equipped to answer, you may delegate by appending a tag at the very end of your reply in this exact format:\n"
+            + "[DELEGATE: <Teammate name> | <The specific question to ask them>]\n"
+            + "You may include up to 2 delegation tags. The system will execute them and stitch the teammate's reply into your response automatically. Only delegate when truly necessary.\n"
+            + "--- END TEAM ---"
         )
 
     kb = (agent.get("knowledge_text") or "").strip()
@@ -550,7 +589,21 @@ async def chat_with_agent(agent_id: str, body: ChatMessageIn, user: dict = Depen
             err = f"[Error: {str(e)}]"
             full += err
             yield f"data: {err}\n\n"
-        await _append_assistant_message(conv_id, full)
+
+        # Execute any delegations the model requested.
+        cleaned, delegations = _parse_delegations(full)
+        final_text = cleaned or full
+        if delegations:
+            for d in delegations[:2]:
+                result = await _run_delegation(user["id"], agent_id, d["agent"], d["question"])
+                if result.get("ok"):
+                    block = f"\n\n— **Asked {result['agent']}**: {d['question']}\n{result['reply']}"
+                else:
+                    block = f"\n\n_({result.get('error', 'Could not reach teammate')})_"
+                final_text += block
+                yield f"data: {block}\n\n"
+
+        await _append_assistant_message(conv_id, final_text)
         yield f"event: done\ndata: {conv_id}\n\n"
 
     return StreamingResponse(
@@ -705,6 +758,239 @@ async def org_tree(user: dict = Depends(get_current_user)):
 
     return {"roots": build("__root__"), "count": len(agents)}
 
+# ---------------- Billing (Stripe) ----------------
+class CheckoutIn(BaseModel):
+    plan_id: str
+    origin_url: str
+
+@api.post("/billing/checkout")
+async def billing_checkout(body: CheckoutIn, user: dict = Depends(get_current_user)):
+    plan = BILLING_PLANS.get(body.plan_id)
+    if not plan:
+        raise HTTPException(400, "Invalid plan")
+    if not STRIPE_API_KEY:
+        raise HTTPException(503, "Billing not configured")
+
+    origin = body.origin_url.rstrip("/")
+    success_url = f"{origin}/billing?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{origin}/billing?cancelled=1"
+
+    stripe = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=f"{origin}/api/webhook/stripe")
+    req = CheckoutSessionRequest(
+        amount=plan["amount"],
+        currency=plan["currency"],
+        success_url=success_url,
+        cancel_url=cancel_url,
+        metadata={"user_id": user["id"], "email": user["email"], "plan_id": body.plan_id, "source": "quotientiq_subscribe"},
+    )
+    try:
+        session = await stripe.create_checkout_session(req)
+    except Exception as e:
+        raise HTTPException(502, f"Stripe error: {e}")
+
+    await db.payment_transactions.insert_one({
+        "session_id": session.session_id,
+        "user_id": user["id"],
+        "email": user["email"],
+        "plan_id": body.plan_id,
+        "amount": plan["amount"],
+        "currency": plan["currency"],
+        "status": "initiated",
+        "payment_status": "unpaid",
+        "metadata": {"plan_id": body.plan_id},
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    })
+
+    return {"url": session.url, "session_id": session.session_id}
+
+@api.get("/billing/status/{session_id}")
+async def billing_status(session_id: str, request: Request, user: dict = Depends(get_current_user)):
+    txn = await db.payment_transactions.find_one({"session_id": session_id, "user_id": user["id"]})
+    if not txn:
+        raise HTTPException(404, "Session not found")
+
+    # If already finalized, return cached state.
+    if txn.get("payment_status") == "paid":
+        return {"status": txn["status"], "payment_status": "paid", "plan": txn["plan_id"]}
+
+    if not STRIPE_API_KEY:
+        raise HTTPException(503, "Billing not configured")
+
+    origin = str(request.base_url).rstrip("/")
+    stripe = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=f"{origin}/api/webhook/stripe")
+    try:
+        status: CheckoutStatusResponse = await stripe.get_checkout_status(session_id)
+    except Exception as e:
+        raise HTTPException(502, f"Stripe error: {e}")
+
+    update = {
+        "status": status.status,
+        "payment_status": status.payment_status,
+        "updated_at": now_iso(),
+    }
+    await db.payment_transactions.update_one({"session_id": session_id}, {"$set": update})
+
+    # Activate plan on first successful payment only.
+    if status.payment_status == "paid" and txn.get("payment_status") != "paid":
+        await db.users.update_one(
+            {"_id": to_object_id(user["id"], "user id")},
+            {"$set": {"plan": txn["plan_id"], "plan_activated_at": now_iso()}},
+        )
+
+    return {"status": status.status, "payment_status": status.payment_status, "plan": txn["plan_id"]}
+
+@api.get("/billing/me")
+async def billing_me(user: dict = Depends(get_current_user)):
+    return {
+        "plan": user.get("plan", "free"),
+        "plan_activated_at": user.get("plan_activated_at"),
+        "available_plans": [{"id": k, **v} for k, v in BILLING_PLANS.items()],
+    }
+
+# Stripe webhook (no auth — Stripe-signed)
+@api.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    if not STRIPE_API_KEY:
+        return {"ok": False, "error": "billing not configured"}
+    body = await request.body()
+    sig = request.headers.get("Stripe-Signature", "")
+    host_url = str(request.base_url).rstrip("/")
+    stripe = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=f"{host_url}/api/webhook/stripe")
+    try:
+        ev = await stripe.handle_webhook(body, sig)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    txn = await db.payment_transactions.find_one({"session_id": ev.session_id}) if ev.session_id else None
+    if not txn:
+        return {"ok": True, "event": ev.event_type}
+    if ev.payment_status == "paid" and txn.get("payment_status") != "paid":
+        await db.payment_transactions.update_one(
+            {"session_id": ev.session_id},
+            {"$set": {"payment_status": "paid", "status": "complete", "updated_at": now_iso()}},
+        )
+        await db.users.update_one(
+            {"_id": to_object_id(txn["user_id"], "user id")},
+            {"$set": {"plan": txn["plan_id"], "plan_activated_at": now_iso()}},
+        )
+    return {"ok": True, "event": ev.event_type}
+
+# ---------------- Multi-Agent Delegation ----------------
+DELEGATION_RE = None  # built lazily to avoid top-level regex parse
+
+def _parse_delegations(text: str) -> tuple[str, list[dict]]:
+    """Find inline [DELEGATE: <agent name> | <question>] markers and strip them from text."""
+    import re
+    pattern = re.compile(r"\[DELEGATE\s*:\s*(.+?)\s*\|\s*(.+?)\]", re.DOTALL)
+    delegations = [{"agent": m.group(1).strip(), "question": m.group(2).strip()} for m in pattern.finditer(text)]
+    cleaned = pattern.sub("", text).strip()
+    return cleaned, delegations
+
+async def _run_delegation(user_id: str, source_agent_id: str, agent_name: str, question: str) -> dict:
+    target = await db.agents.find_one({"user_id": user_id, "name": {"$regex": f"^{agent_name}$", "$options": "i"}})
+    if not target:
+        return {"agent": agent_name, "question": question, "ok": False, "error": "Teammate not found"}
+    chat = _make_llm_chat(f"delegate-{source_agent_id}", await _build_system_message_full(target))
+    full = ""
+    try:
+        async for ev in chat.stream_message(UserMessage(text=question)):
+            if isinstance(ev, TextDelta):
+                full += ev.content
+            elif isinstance(ev, StreamDone):
+                break
+    except Exception as e:
+        return {"agent": target["name"], "question": question, "ok": False, "error": str(e)}
+    return {"agent": target["name"], "question": question, "ok": True, "reply": full.strip()}
+
+@api.post("/agents/{agent_id}/delegate")
+async def manual_delegate(agent_id: str, target_id: str, message: str, user: dict = Depends(get_current_user)):
+    """Manually delegate a question from one agent's chat to another agent (sync)."""
+    await _load_agent_or_404(agent_id, user["id"])
+    target = await db.agents.find_one({"_id": to_object_id(target_id, "agent id"), "user_id": user["id"]})
+    if not target:
+        raise HTTPException(404, "Target agent not found")
+    result = await _run_delegation(user["id"], agent_id, target["name"], message)
+    return result
+
+# ---------------- Public Embed (Layer 25) ----------------
+class EmbedChatIn(BaseModel):
+    message: str
+    visitor_id: Optional[str] = None
+
+@api.post("/agents/{agent_id}/embed-enable")
+async def embed_enable(agent_id: str, user: dict = Depends(get_current_user)):
+    """Generate / rotate a public embed token for this agent."""
+    agent = await _load_agent_or_404(agent_id, user["id"])
+    token = secrets.token_urlsafe(24)
+    await db.agents.update_one(
+        {"_id": to_object_id(agent_id, "agent id")},
+        {"$set": {"embed_token": token, "embed_enabled": True}},
+    )
+    return {"embed_token": token, "agent_id": agent_id, "agent_name": agent["name"]}
+
+@api.post("/agents/{agent_id}/embed-disable")
+async def embed_disable(agent_id: str, user: dict = Depends(get_current_user)):
+    await _load_agent_or_404(agent_id, user["id"])
+    await db.agents.update_one(
+        {"_id": to_object_id(agent_id, "agent id")},
+        {"$set": {"embed_enabled": False}, "$unset": {"embed_token": ""}},
+    )
+    return {"ok": True}
+
+@api.get("/embed/{token}/agent")
+async def embed_get_agent(token: str):
+    agent = await db.agents.find_one({"embed_token": token, "embed_enabled": True})
+    if not agent:
+        raise HTTPException(404, "Embed not found")
+    return {
+        "agent_id": str(agent["_id"]),
+        "name": agent["name"],
+        "category": agent.get("category"),
+        "icon": agent.get("icon"),
+        "description": agent.get("description", ""),
+    }
+
+@api.post("/embed/{token}/chat")
+async def embed_chat(token: str, body: EmbedChatIn):
+    agent = await db.agents.find_one({"embed_token": token, "embed_enabled": True})
+    if not agent:
+        raise HTTPException(404, "Embed not found")
+    user_id = agent["user_id"]
+    agent_id = str(agent["_id"])
+    visitor = body.visitor_id or f"v_{secrets.token_hex(6)}"
+
+    # Build/find a per-visitor conversation thread
+    conv = await db.conversations.find_one({"agent_id": agent_id, "user_id": user_id, "customer_name": visitor})
+    if conv:
+        conv_id = str(conv["_id"])
+    else:
+        res = await db.conversations.insert_one({
+            "agent_id": agent_id, "user_id": user_id, "customer_name": visitor,
+            "messages": [], "created_at": now_iso(), "updated_at": now_iso(),
+            "source": "embed",
+        })
+        conv_id = str(res.inserted_id)
+
+    chat = _make_llm_chat(conv_id, await _build_system_message_full(agent))
+    full = ""
+    async for ev in chat.stream_message(UserMessage(text=body.message)):
+        if isinstance(ev, TextDelta):
+            full += ev.content
+        elif isinstance(ev, StreamDone):
+            break
+
+    cleaned, _ = _parse_delegations(full)
+    now = now_iso()
+    await db.conversations.update_one(
+        {"_id": to_object_id(conv_id, "conversation id")},
+        {"$push": {"messages": {"$each": [
+            {"role": "user", "content": body.message, "timestamp": now},
+            {"role": "assistant", "content": cleaned or full, "timestamp": now},
+        ]}}, "$set": {"updated_at": now}},
+    )
+    return {"reply": cleaned or full, "visitor_id": visitor}
+
 @api.get("/")
 async def root():
     return {"service": "QuotientIQ API", "status": "ok"}
@@ -728,8 +1014,12 @@ async def startup():
     await db.users.create_index("email", unique=True)
     await db.agents.create_index("user_id")
     await db.agents.create_index([("user_id", 1), ("parent_agent_id", 1)])
+    await db.agents.create_index("embed_token", sparse=True)
     await db.conversations.create_index([("user_id", 1), ("agent_id", 1)])
     await db.company_profiles.create_index("user_id", unique=True)
+    await db.login_attempts.create_index("identifier")
+    await db.payment_transactions.create_index("session_id", unique=True)
+    await db.payment_transactions.create_index("user_id")
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@quotientiq.com").lower()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")

@@ -11,6 +11,7 @@ import { KnowledgePanel } from "@/components/chat/KnowledgePanel";
 import { InstructionsPanel, QuickPrompts } from "@/components/chat/InstructionsPanel";
 import { MessageList } from "@/components/chat/MessageList";
 import { Composer } from "@/components/chat/Composer";
+import EmbedSection from "@/components/chat/EmbedSection";
 
 const ICON = { Headphones, TrendingUp, Users, Megaphone, BarChart3, Cog, Scale, DollarSign, Sparkles };
 
@@ -128,6 +129,7 @@ export default function Chat() {
                 onChange={(value) => setAgent({ ...agent, instructions: value })}
                 onSave={handleSaveAgent}
               />
+              <EmbedSection agent={agent} onAgentUpdate={setAgent} />
               <QuickPrompts onPick={setInput} />
             </div>
           </aside>

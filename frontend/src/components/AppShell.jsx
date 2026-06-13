@@ -2,7 +2,7 @@ import React from "react";
 import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
-import { LayoutGrid, Store, Wrench, BarChart3, LogOut, Sparkles, Brain, Network } from "lucide-react";
+import { LayoutGrid, Store, Wrench, BarChart3, LogOut, Sparkles, Brain, Network, CreditCard } from "lucide-react";
 
 const NAV = [
   { to: "/dashboard", label: "Dashboard", icon: LayoutGrid, tid: "nav-dashboard" },
@@ -11,6 +11,7 @@ const NAV = [
   { to: "/profile", label: "Memory", icon: Brain, tid: "nav-profile" },
   { to: "/builder", label: "Builder", icon: Wrench, tid: "nav-builder" },
   { to: "/analytics", label: "Analytics", icon: BarChart3, tid: "nav-analytics" },
+  { to: "/billing", label: "Billing", icon: CreditCard, tid: "nav-billing" },
 ];
 
 export default function AppShell({ children }) {

@@ -489,3 +489,277 @@ class TestChatV2Context:
             fresh_user_client.delete(f"{API}/agents/{a['id']}")
             fresh_user_client.delete(f"{API}/agents/{b['id']}")
 
+
+# ==================== V3 ====================
+
+# -------- V3: Brute-force lockout --------
+class TestBruteForceLockout:
+    def test_lockout_after_5_failures(self):
+        # Use fully unique email so admin tests aren't affected.
+        email = f"lockouttest_{uuid.uuid4().hex[:10]}@example.com"
+        # Register the user first so the email "exists" (the lockout should
+        # work regardless, but verifies success-clears-counter path).
+        rr = requests.post(f"{API}/auth/register", json={
+            "email": email, "password": "Correct1234!", "name": "Lock", "company": "L"
+        })
+        assert rr.status_code == 200, rr.text
+
+        # 5 failed attempts → all should be 401.
+        for i in range(5):
+            r = requests.post(f"{API}/auth/login", json={"email": email, "password": "wrong"})
+            assert r.status_code == 401, f"attempt {i + 1}: expected 401, got {r.status_code} {r.text}"
+
+        # 6th attempt should be 429.
+        r6 = requests.post(f"{API}/auth/login", json={"email": email, "password": "wrong"})
+        assert r6.status_code == 429, f"expected 429 on 6th, got {r6.status_code} {r6.text}"
+        # Body mentions retry / minutes
+        body6 = r6.text.lower()
+        assert "try again" in body6 or "minute" in body6 or "too many" in body6
+
+        # Even a correct password should be blocked while locked.
+        r_correct_locked = requests.post(f"{API}/auth/login", json={"email": email, "password": "Correct1234!"})
+        assert r_correct_locked.status_code == 429
+
+        # Cleanup login_attempts so subsequent runs / admin aren't impacted.
+        # Load backend .env to find the live MongoDB connection.
+        from pymongo import MongoClient
+        env_path = "/app/backend/.env"
+        mongo_url = "mongodb://localhost:27017"
+        db_name = "quotientiq_db"
+        try:
+            with open(env_path) as f:
+                for line in f:
+                    if line.startswith("MONGO_URL"):
+                        mongo_url = line.split("=", 1)[1].strip().strip('"')
+                    elif line.startswith("DB_NAME"):
+                        db_name = line.split("=", 1)[1].strip().strip('"')
+        except FileNotFoundError:
+            pass
+        m = MongoClient(mongo_url)
+        m[db_name].login_attempts.delete_many({"identifier": f"email:{email}"})
+        m.close()
+
+        # After clear, correct password works → success path & clears counter.
+        r_ok = requests.post(f"{API}/auth/login", json={"email": email, "password": "Correct1234!"})
+        assert r_ok.status_code == 200, r_ok.text
+
+
+# -------- V3: Billing (Stripe) --------
+class TestBilling:
+    def test_billing_me_default_free(self, fresh_user_client):
+        r = fresh_user_client.get(f"{API}/billing/me")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["plan"] == "free"
+        ids = {p["id"] for p in d["available_plans"]}
+        assert "starter" in ids and "professional" in ids
+        # Each plan has amount + name
+        for p in d["available_plans"]:
+            assert "amount" in p and "name" in p
+
+    def test_checkout_invalid_plan_400(self, fresh_user_client):
+        r = fresh_user_client.post(f"{API}/billing/checkout",
+                                   json={"plan_id": "nonexistent", "origin_url": BASE_URL})
+        assert r.status_code == 400
+
+    def test_checkout_starter_returns_stripe_url(self, fresh_user_client):
+        r = fresh_user_client.post(
+            f"{API}/billing/checkout",
+            json={"plan_id": "starter", "origin_url": BASE_URL},
+            timeout=30,
+        )
+        # 200 with stripe.com url, OR 502/503 if Stripe key isn't usable in this env.
+        if r.status_code in (502, 503):
+            pytest.skip(f"Stripe not configured in env: {r.status_code} {r.text}")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert "url" in d and "session_id" in d
+        assert "stripe.com" in d["url"], f"Expected stripe.com in url, got {d['url']}"
+
+        # Status endpoint should return 200 (no plan yet)
+        sid = d["session_id"]
+        s = fresh_user_client.get(f"{API}/billing/status/{sid}", timeout=30)
+        # Stripe may return 200 with payment_status unpaid; could 502 if stripe down
+        if s.status_code == 502:
+            pytest.skip(f"Stripe status flaky: {s.text}")
+        assert s.status_code == 200, s.text
+        sd = s.json()
+        assert sd.get("payment_status") != "paid"
+
+        # Plan should remain 'free' because not paid
+        me = fresh_user_client.get(f"{API}/billing/me").json()
+        assert me["plan"] == "free"
+
+    def test_status_unknown_session_404(self, fresh_user_client):
+        r = fresh_user_client.get(f"{API}/billing/status/cs_test_doesnotexist_{uuid.uuid4().hex}")
+        assert r.status_code == 404
+
+    def test_status_cross_user_isolation(self, fresh_user_client):
+        # User A creates a session
+        r = fresh_user_client.post(
+            f"{API}/billing/checkout",
+            json={"plan_id": "starter", "origin_url": BASE_URL},
+            timeout=30,
+        )
+        if r.status_code in (502, 503):
+            pytest.skip("Stripe not configured")
+        assert r.status_code == 200, r.text
+        sid = r.json()["session_id"]
+
+        # User B (fresh) tries to query → 404
+        s = requests.Session()
+        email = f"other_{uuid.uuid4().hex[:8]}@quotientiq.com"
+        rr = s.post(f"{API}/auth/register", json={
+            "email": email, "password": "Other1234!", "name": "Other", "company": "X"
+        })
+        assert rr.status_code == 200
+        s.headers["Authorization"] = f"Bearer {rr.json()['access_token']}"
+        bad = s.get(f"{API}/billing/status/{sid}")
+        assert bad.status_code == 404
+
+
+# -------- V3: _parse_delegations unit --------
+class TestParseDelegations:
+    def test_parse_extracts_and_cleans(self):
+        # Import directly from server module
+        import sys
+        sys.path.insert(0, "/app/backend")
+        from server import _parse_delegations
+
+        text = (
+            "Hello team!\n\n"
+            "[DELEGATE: HR Person | how many vacation days do new hires get?]\n"
+            "Some middle text.\n"
+            "[DELEGATE:  Finance  |   what's the Q3 budget? ]\n"
+            "Goodbye!"
+        )
+        cleaned, dels = _parse_delegations(text)
+        assert len(dels) == 2
+        assert dels[0]["agent"] == "HR Person"
+        assert dels[0]["question"] == "how many vacation days do new hires get?"
+        assert dels[1]["agent"] == "Finance"
+        assert dels[1]["question"] == "what's the Q3 budget?"
+        assert "[DELEGATE" not in cleaned
+        assert "Hello team!" in cleaned
+        assert "Goodbye!" in cleaned
+
+    def test_parse_no_delegation(self):
+        import sys
+        sys.path.insert(0, "/app/backend")
+        from server import _parse_delegations
+        cleaned, dels = _parse_delegations("Plain reply, no markers.")
+        assert dels == []
+        assert cleaned == "Plain reply, no markers."
+
+
+# -------- V3: Multi-agent delegation E2E --------
+class TestMultiAgentDelegation:
+    def test_delegation_stitched_in_chat(self, fresh_user_client):
+        # Install Sales + HR templates from marketplace
+        sales_r = fresh_user_client.post(f"{API}/marketplace/install/sales")
+        hr_r = fresh_user_client.post(f"{API}/marketplace/install/recruiter")
+        assert sales_r.status_code == 200, sales_r.text
+        assert hr_r.status_code == 200, hr_r.text
+        sales = sales_r.json()
+        hr = hr_r.json()
+
+        # Rename HR agent to 'HR Person' for predictable matching
+        hr_renamed = fresh_user_client.patch(f"{API}/agents/{hr['id']}", json={
+            "name": "HR Person", "role": hr.get("role", "Recruiter"),
+            "category": hr.get("category", "HR"),
+            "icon": hr.get("icon", "Bot"), "description": hr.get("description", ""),
+            "instructions": "You are the HR Person. New hires receive 15 vacation days per year. Be concise.",
+        })
+        assert hr_renamed.status_code == 200, hr_renamed.text
+
+        # Patch Sales agent A to instruct delegation
+        sales_upd = fresh_user_client.patch(f"{API}/agents/{sales['id']}", json={
+            "name": "Salesperson",
+            "role": sales.get("role", "Sales"),
+            "category": sales.get("category", "Sales"),
+            "icon": sales.get("icon", "Bot"),
+            "description": sales.get("description", ""),
+            "instructions": (
+                "You are a Salesperson. When asked about HR or hiring, "
+                "always end your reply with [DELEGATE: HR Person | <restate the user question>]. "
+                "Always include such a marker for HR-related questions."
+            ),
+        })
+        assert sales_upd.status_code == 200, sales_upd.text
+
+        try:
+            r = fresh_user_client.post(
+                f"{API}/agents/{sales['id']}/chat-sync",
+                json={"message": "how many vacation days do new hires get?"},
+                timeout=120,
+            )
+            assert r.status_code == 200, r.text
+            reply = r.json()["reply"]
+            # Stitched "Asked HR Person" block
+            assert "Asked" in reply and "HR Person" in reply, (
+                f"Expected stitched 'Asked HR Person' block. Got: {reply!r}"
+            )
+            # Likely contains the actual answer about vacation days
+            assert ("15" in reply or "vacation" in reply.lower()), (
+                f"Expected HR answer content in stitched block. Got: {reply!r}"
+            )
+        finally:
+            fresh_user_client.delete(f"{API}/agents/{sales['id']}")
+            fresh_user_client.delete(f"{API}/agents/{hr['id']}")
+
+
+# -------- V3: Embed flow --------
+class TestEmbed:
+    def test_embed_enable_disable_and_public_chat(self, fresh_user_client):
+        agent = fresh_user_client.get(f"{API}/agents").json()[0]
+        agent_id = agent["id"]
+
+        # Enable embed → token returned
+        e = fresh_user_client.post(f"{API}/agents/{agent_id}/embed-enable")
+        assert e.status_code == 200, e.text
+        token = e.json()["embed_token"]
+        assert isinstance(token, str) and len(token) > 10
+
+        # Public GET /api/embed/{token}/agent (NO auth)
+        pub = requests.get(f"{API}/embed/{token}/agent")
+        assert pub.status_code == 200, pub.text
+        meta = pub.json()
+        assert meta["name"] == agent["name"]
+        assert meta["agent_id"] == agent_id
+
+        # Public POST chat (NO auth)
+        chat = requests.post(f"{API}/embed/{token}/chat",
+                             json={"message": "Hi, say hello in 5 words"}, timeout=60)
+        assert chat.status_code == 200, chat.text
+        d = chat.json()
+        assert "reply" in d and isinstance(d["reply"], str) and len(d["reply"]) > 0
+        assert "visitor_id" in d and d["visitor_id"].startswith("v_")
+
+        # Invalid token → 404
+        bad = requests.get(f"{API}/embed/totally_invalid_token_xyz/agent")
+        assert bad.status_code == 404
+        bad2 = requests.post(f"{API}/embed/totally_invalid_token_xyz/chat",
+                             json={"message": "hi"})
+        assert bad2.status_code == 404
+
+        # Disable
+        d = fresh_user_client.post(f"{API}/agents/{agent_id}/embed-disable")
+        assert d.status_code == 200
+        # After disable, public endpoint 404
+        post = requests.get(f"{API}/embed/{token}/agent")
+        assert post.status_code == 404
+
+
+# -------- V3: Widget loader (static asset) --------
+class TestWidgetLoader:
+    def test_widget_js_served(self):
+        r = requests.get(f"{BASE_URL}/widget.js", timeout=10)
+        assert r.status_code == 200, r.text[:200]
+        # IIFE / self-invoking pattern present
+        body = r.text
+        assert "(function" in body or "(()" in body or "function(" in body, (
+            f"widget.js does not look like an IIFE. First 200 chars: {body[:200]!r}"
+        )
+        # Mentions data-quotientiq-token attribute that EmbedSection emits
+        assert "quotientiq" in body.lower()
+
