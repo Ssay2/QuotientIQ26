@@ -97,8 +97,8 @@ export default function Landing() {
                     </div>
                   </div>
                   <div className="space-y-3">
-                    <div className="bubble-ai rounded-md p-3 text-sm">Hi! I'm your AI support agent. I've read all 47 pages of your docs. What can I help with?</div>
-                    <div className="bubble-user rounded-md p-3 text-sm ml-6">What's your refund policy?</div>
+                    <div className="bubble-ai rounded-md p-3 text-sm">Hi! I&apos;m your AI support agent. I&apos;ve read all 47 pages of your docs. What can I help with?</div>
+                    <div className="bubble-user rounded-md p-3 text-sm ml-6">What&apos;s your refund policy?</div>
                     <div className="bubble-ai rounded-md p-3 text-sm">Refunds within 30 days, no questions asked. Want me to start the process?</div>
                     <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground pt-2 flex items-center gap-2">
                       <span className="size-1.5 rounded-full bg-emerald-500" /> Resolved in 4s · saved 12 min
@@ -117,8 +117,8 @@ export default function Landing() {
           <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground shrink-0">Trusted by teams at</div>
           <div className="flex gap-12 overflow-hidden">
             <div className="flex gap-12 marquee whitespace-nowrap">
-              {["NORTHWIND", "CONTOSO", "ACME CO", "FABRIKAM", "TAILSPIN", "ADVENTUREWORKS", "WIDE WORLD", "BLUE YONDER", "NORTHWIND", "CONTOSO", "ACME CO", "FABRIKAM"].map((c, i) => (
-                <span key={i} className="font-display font-medium tracking-tight text-2xl text-foreground/40">{c}</span>
+              {["NORTHWIND", "CONTOSO", "ACME CO", "FABRIKAM", "TAILSPIN", "ADVENTUREWORKS", "WIDE WORLD", "BLUE YONDER", "NORTHWIND-2", "CONTOSO-2", "ACME CO-2", "FABRIKAM-2"].map((c) => (
+                <span key={c} className="font-display font-medium tracking-tight text-2xl text-foreground/40">{c.replace(/-\d+$/, "")}</span>
               ))}
             </div>
           </div>

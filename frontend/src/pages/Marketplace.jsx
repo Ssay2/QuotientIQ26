@@ -15,7 +15,13 @@ export default function Marketplace() {
   const [installing, setInstalling] = useState(null);
   const nav = useNavigate();
 
-  useEffect(() => { api.get("/marketplace").then(({ data }) => setItems(data)); }, []);
+  useEffect(() => {
+    let cancelled = false;
+    api.get("/marketplace")
+      .then(({ data }) => { if (!cancelled) setItems(data); })
+      .catch((err) => { if (!cancelled) console.error("Marketplace load failed:", err); });
+    return () => { cancelled = true; };
+  }, []);
 
   const install = async (id) => {
     setInstalling(id);

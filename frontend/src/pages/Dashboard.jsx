@@ -15,16 +15,23 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       try {
         const [a, s] = await Promise.all([
           api.get("/agents"),
           api.get("/analytics/summary"),
         ]);
+        if (cancelled) return;
         setAgents(a.data);
         setStats(s.data);
-      } finally { setLoading(false); }
+      } catch (err) {
+        if (!cancelled) console.error("Dashboard load failed:", err);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
     })();
+    return () => { cancelled = true; };
   }, []);
 
   return (

@@ -31,6 +31,17 @@ db = client[os.environ['DB_NAME']]
 EMERGENT_LLM_KEY = os.environ['EMERGENT_LLM_KEY']
 JWT_ALGORITHM = "HS256"
 
+# ---------------- Validation Helpers ----------------
+def to_object_id(value: str, label: str = "id") -> ObjectId:
+    """Convert a string to ObjectId or raise HTTP 400."""
+    try:
+        return ObjectId(value)
+    except Exception:
+        raise HTTPException(400, f"Invalid {label}")
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 # ---------------- Helpers ----------------
 def hash_password(pw: str) -> str:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -98,6 +109,14 @@ class AgentIn(BaseModel):
     description: str = ""
     category: str = "Customer Service"
     icon: str = "Headphones"
+
+class AgentPatch(BaseModel):
+    name: Optional[str] = None
+    role: Optional[str] = None
+    instructions: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    icon: Optional[str] = None
 
 class ChatMessageIn(BaseModel):
     message: str
@@ -192,30 +211,35 @@ async def create_agent(body: AgentIn, user: dict = Depends(get_current_user)):
 
 @api.get("/agents/{agent_id}")
 async def get_agent(agent_id: str, user: dict = Depends(get_current_user)):
-    a = await db.agents.find_one({"_id": ObjectId(agent_id), "user_id": user["id"]})
+    a = await db.agents.find_one({"_id": to_object_id(agent_id, "agent id"), "user_id": user["id"]})
     if not a:
         raise HTTPException(404, "Agent not found")
     a["id"] = str(a.pop("_id"))
     return a
 
 @api.patch("/agents/{agent_id}")
-async def update_agent(agent_id: str, body: AgentIn, user: dict = Depends(get_current_user)):
-    await db.agents.update_one(
-        {"_id": ObjectId(agent_id), "user_id": user["id"]},
-        {"$set": body.model_dump()}
-    )
+async def update_agent(agent_id: str, body: AgentPatch, user: dict = Depends(get_current_user)):
+    updates = body.model_dump(exclude_unset=True)
+    if updates:
+        await db.agents.update_one(
+            {"_id": to_object_id(agent_id, "agent id"), "user_id": user["id"]},
+            {"$set": updates}
+        )
     return await get_agent(agent_id, user)
 
 @api.delete("/agents/{agent_id}")
 async def delete_agent(agent_id: str, user: dict = Depends(get_current_user)):
-    await db.agents.delete_one({"_id": ObjectId(agent_id), "user_id": user["id"]})
+    result = await db.agents.delete_one({"_id": to_object_id(agent_id, "agent id"), "user_id": user["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Agent not found")
     await db.conversations.delete_many({"agent_id": agent_id, "user_id": user["id"]})
     return {"ok": True}
 
 # ---------------- Knowledge Base ----------------
 @api.post("/agents/{agent_id}/upload")
 async def upload_pdf(agent_id: str, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    a = await db.agents.find_one({"_id": ObjectId(agent_id), "user_id": user["id"]})
+    oid = to_object_id(agent_id, "agent id")
+    a = await db.agents.find_one({"_id": oid, "user_id": user["id"]})
     if not a:
         raise HTTPException(404, "Agent not found")
     if not file.filename.lower().endswith(".pdf"):
@@ -234,27 +258,27 @@ async def upload_pdf(agent_id: str, file: UploadFile = File(...), user: dict = D
         "name": file.filename,
         "size": len(content),
         "chars": len(text),
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "uploaded_at": now_iso(),
     }]
     await db.agents.update_one(
-        {"_id": ObjectId(agent_id)},
+        {"_id": oid},
         {"$set": {"knowledge_text": new_text[:200000], "knowledge_files": files}}
     )
     return {"ok": True, "filename": file.filename, "chars": len(text), "files": files}
 
 @api.delete("/agents/{agent_id}/files/{filename}")
 async def delete_file(agent_id: str, filename: str, user: dict = Depends(get_current_user)):
-    a = await db.agents.find_one({"_id": ObjectId(agent_id), "user_id": user["id"]})
+    oid = to_object_id(agent_id, "agent id")
+    a = await db.agents.find_one({"_id": oid, "user_id": user["id"]})
     if not a:
         raise HTTPException(404, "Agent not found")
     files = [f for f in a.get("knowledge_files", []) if f["name"] != filename]
-    # Rebuild knowledge text without the deleted file's section (simple approach: keep remaining sections)
     text = a.get("knowledge_text", "")
     blocks = text.split("### ")
     keep = [b for b in blocks if not b.startswith(filename)]
     new_text = "### ".join(keep).strip()
     await db.agents.update_one(
-        {"_id": ObjectId(agent_id)},
+        {"_id": oid},
         {"$set": {"knowledge_files": files, "knowledge_text": new_text}}
     )
     return {"ok": True, "files": files}
@@ -271,64 +295,89 @@ async def list_conversations(agent_id: str, user: dict = Depends(get_current_use
 
 @api.get("/conversations/{conv_id}")
 async def get_conversation(conv_id: str, user: dict = Depends(get_current_user)):
-    c = await db.conversations.find_one({"_id": ObjectId(conv_id), "user_id": user["id"]})
+    c = await db.conversations.find_one({"_id": to_object_id(conv_id, "conversation id"), "user_id": user["id"]})
     if not c:
         raise HTTPException(404, "Conversation not found")
     c["id"] = str(c.pop("_id"))
     return c
 
-# ---------------- Chat (SSE streaming) ----------------
-@api.post("/agents/{agent_id}/chat")
-async def chat_with_agent(agent_id: str, body: ChatMessageIn, user: dict = Depends(get_current_user)):
-    agent = await db.agents.find_one({"_id": ObjectId(agent_id), "user_id": user["id"]})
+# ---------------- Chat helpers ----------------
+async def _load_agent_or_404(agent_id: str, user_id: str) -> dict:
+    agent = await db.agents.find_one({"_id": to_object_id(agent_id, "agent id"), "user_id": user_id})
     if not agent:
         raise HTTPException(404, "Agent not found")
+    return agent
 
-    # Get or create conversation
+async def _get_or_create_conversation(agent_id: str, user_id: str, body: "ChatMessageIn") -> tuple[str, dict]:
     if body.conversation_id:
-        conv = await db.conversations.find_one({"_id": ObjectId(body.conversation_id), "user_id": user["id"]})
+        conv = await db.conversations.find_one(
+            {"_id": to_object_id(body.conversation_id, "conversation id"), "user_id": user_id}
+        )
         if not conv:
             raise HTTPException(404, "Conversation not found")
-        conv_id = str(conv["_id"])
-    else:
-        new_conv = {
-            "agent_id": agent_id,
-            "user_id": user["id"],
-            "customer_name": body.customer_name or "Guest",
-            "messages": [],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        res = await db.conversations.insert_one(new_conv)
-        conv_id = str(res.inserted_id)
-        conv = new_conv
+        return str(conv["_id"]), conv
+    new_conv = {
+        "agent_id": agent_id,
+        "user_id": user_id,
+        "customer_name": body.customer_name or "Guest",
+        "messages": [],
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    res = await db.conversations.insert_one(new_conv)
+    return str(res.inserted_id), new_conv
 
-    # Append user message
-    user_msg = {"role": "user", "content": body.message, "timestamp": datetime.now(timezone.utc).isoformat()}
-    await db.conversations.update_one(
-        {"_id": ObjectId(conv_id)},
-        {"$push": {"messages": user_msg}, "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}}
+def _build_system_message(agent: dict) -> str:
+    base = agent.get("instructions") or "You are a helpful AI assistant."
+    kb = (agent.get("knowledge_text") or "").strip()
+    if not kb:
+        return base
+    return (
+        base
+        + "\n\n--- KNOWLEDGE BASE ---\n"
+        + kb[:30000]
+        + "\n--- END KNOWLEDGE BASE ---\n\n"
+        + "Answer based strictly on the knowledge base above when possible. "
+        + "If the answer is not in the knowledge base, say you don't have that information."
     )
 
-    # Build system message with knowledge base
-    kb = (agent.get("knowledge_text") or "").strip()
-    system_message = (agent.get("instructions") or "You are a helpful AI assistant.")
-    if kb:
-        system_message += "\n\n--- KNOWLEDGE BASE ---\n" + kb[:30000] + "\n--- END KNOWLEDGE BASE ---\n\nAnswer based strictly on the knowledge base above when possible. If the answer is not in the knowledge base, say you don't have that information."
+def _build_user_text(latest: str, prev_messages: list[dict]) -> str:
+    recent = (prev_messages or [])[-10:]
+    if not recent:
+        return latest
+    history = "".join(f"\n{m['role'].upper()}: {m['content']}" for m in recent)
+    return f"Conversation so far:{history}\n\nLatest user message: {latest}"
 
-    # Build history (last 10)
-    history_text = ""
-    prev = (conv.get("messages") or [])[-10:]
-    for m in prev:
-        history_text += f"\n{m['role'].upper()}: {m['content']}"
-
-    chat = LlmChat(
+def _make_llm_chat(conv_id: str, system_message: str) -> LlmChat:
+    return LlmChat(
         api_key=EMERGENT_LLM_KEY,
         session_id=conv_id,
         system_message=system_message,
     ).with_model("openai", "gpt-5.2")
 
-    user_message = UserMessage(text=body.message if not history_text else f"Conversation so far:{history_text}\n\nLatest user message: {body.message}")
+async def _append_user_message(conv_id: str, content: str) -> None:
+    await db.conversations.update_one(
+        {"_id": to_object_id(conv_id, "conversation id")},
+        {"$push": {"messages": {"role": "user", "content": content, "timestamp": now_iso()}},
+         "$set": {"updated_at": now_iso()}},
+    )
+
+async def _append_assistant_message(conv_id: str, content: str) -> None:
+    await db.conversations.update_one(
+        {"_id": to_object_id(conv_id, "conversation id")},
+        {"$push": {"messages": {"role": "assistant", "content": content, "timestamp": now_iso()}},
+         "$set": {"updated_at": now_iso()}},
+    )
+
+# ---------------- Chat (SSE streaming) ----------------
+@api.post("/agents/{agent_id}/chat")
+async def chat_with_agent(agent_id: str, body: ChatMessageIn, user: dict = Depends(get_current_user)):
+    agent = await _load_agent_or_404(agent_id, user["id"])
+    conv_id, conv = await _get_or_create_conversation(agent_id, user["id"], body)
+    await _append_user_message(conv_id, body.message)
+
+    chat = _make_llm_chat(conv_id, _build_system_message(agent))
+    user_message = UserMessage(text=_build_user_text(body.message, conv.get("messages")))
 
     async def event_stream():
         full = ""
@@ -343,52 +392,22 @@ async def chat_with_agent(agent_id: str, body: ChatMessageIn, user: dict = Depen
             err = f"[Error: {str(e)}]"
             full += err
             yield f"data: {err}\n\n"
-        # Persist assistant message
-        await db.conversations.update_one(
-            {"_id": ObjectId(conv_id)},
-            {"$push": {"messages": {"role": "assistant", "content": full, "timestamp": datetime.now(timezone.utc).isoformat()}},
-             "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}}
-        )
+        await _append_assistant_message(conv_id, full)
         yield f"event: done\ndata: {conv_id}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"})
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 # Non-streaming variant for simpler testing
 @api.post("/agents/{agent_id}/chat-sync")
 async def chat_sync(agent_id: str, body: ChatMessageIn, user: dict = Depends(get_current_user)):
-    agent = await db.agents.find_one({"_id": ObjectId(agent_id), "user_id": user["id"]})
-    if not agent:
-        raise HTTPException(404, "Agent not found")
+    agent = await _load_agent_or_404(agent_id, user["id"])
+    conv_id, conv = await _get_or_create_conversation(agent_id, user["id"], body)
 
-    if body.conversation_id:
-        conv = await db.conversations.find_one({"_id": ObjectId(body.conversation_id), "user_id": user["id"]})
-        if not conv:
-            raise HTTPException(404, "Conversation not found")
-        conv_id = str(conv["_id"])
-    else:
-        new_conv = {
-            "agent_id": agent_id, "user_id": user["id"],
-            "customer_name": body.customer_name or "Guest",
-            "messages": [],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        res = await db.conversations.insert_one(new_conv)
-        conv_id = str(res.inserted_id)
-        conv = new_conv
-
-    kb = (agent.get("knowledge_text") or "").strip()
-    system_message = (agent.get("instructions") or "You are a helpful AI assistant.")
-    if kb:
-        system_message += "\n\n--- KNOWLEDGE BASE ---\n" + kb[:30000]
-
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=conv_id,
-        system_message=system_message,
-    ).with_model("openai", "gpt-5.2")
-
+    chat = _make_llm_chat(conv_id, _build_system_message(agent))
     full = ""
     async for ev in chat.stream_message(UserMessage(text=body.message)):
         if isinstance(ev, TextDelta):
@@ -396,13 +415,13 @@ async def chat_sync(agent_id: str, body: ChatMessageIn, user: dict = Depends(get
         elif isinstance(ev, StreamDone):
             break
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_iso()
     await db.conversations.update_one(
-        {"_id": ObjectId(conv_id)},
+        {"_id": to_object_id(conv_id, "conversation id")},
         {"$push": {"messages": {"$each": [
             {"role": "user", "content": body.message, "timestamp": now},
             {"role": "assistant", "content": full, "timestamp": now},
-        ]}}, "$set": {"updated_at": now}}
+        ]}}, "$set": {"updated_at": now}},
     )
     return {"conversation_id": conv_id, "reply": full}
 

@@ -41,7 +41,7 @@ export default function Builder() {
         <div className="mb-10">
           <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground mb-3">// agent builder</div>
           <h1 className="font-display font-medium text-4xl lg:text-5xl tracking-tighter">Design a custom employee.</h1>
-          <p className="mt-3 text-muted-foreground">Set the name, role, and behavior. You'll upload knowledge after creating.</p>
+          <p className="mt-3 text-muted-foreground">Set the name, role, and behavior. You&apos;ll upload knowledge after creating.</p>
         </div>
 
         <form onSubmit={create} className="border border-border bg-white p-8 space-y-6" data-testid="builder-form">

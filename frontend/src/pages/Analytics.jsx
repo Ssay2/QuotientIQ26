@@ -7,7 +7,13 @@ import { DollarSign, Clock, Zap, MessageSquare, TrendingUp } from "lucide-react"
 export default function Analytics() {
   const [stats, setStats] = useState(null);
 
-  useEffect(() => { api.get("/analytics/summary").then(({ data }) => setStats(data)); }, []);
+  useEffect(() => {
+    let cancelled = false;
+    api.get("/analytics/summary")
+      .then(({ data }) => { if (!cancelled) setStats(data); })
+      .catch((err) => { if (!cancelled) console.error("Analytics load failed:", err); });
+    return () => { cancelled = true; };
+  }, []);
 
   const tiles = [
     { k: "Tasks completed", v: stats?.tasks_completed ?? 0, icon: Zap, sub: "AI replies served" },
@@ -23,7 +29,7 @@ export default function Analytics() {
         <div className="mb-12">
           <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground mb-3">// analytics</div>
           <h1 className="font-display font-medium text-4xl lg:text-5xl tracking-tighter">Workforce performance.</h1>
-          <p className="mt-3 text-muted-foreground">A live readout of your AI workforce's impact.</p>
+          <p className="mt-3 text-muted-foreground">A live readout of your AI workforce&apos;s impact.</p>
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-5 gap-px bg-border border border-border mb-10" data-testid="analytics-tiles">

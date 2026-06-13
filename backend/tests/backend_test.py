@@ -8,8 +8,9 @@ import requests
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://quotient-mvp.preview.emergentagent.com").rstrip("/")
 API = f"{BASE_URL}/api"
-ADMIN_EMAIL = "admin@quotientiq.com"
-ADMIN_PASSWORD = "admin123"
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@quotientiq.com")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+assert ADMIN_PASSWORD, "ADMIN_PASSWORD env var must be set to run backend tests"
 
 
 # -------- Fixtures --------

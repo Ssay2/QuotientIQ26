@@ -45,7 +45,7 @@ export default function Login() {
         <div className="relative">
           <div className="font-mono text-[10px] uppercase tracking-widest text-white/40 mb-6">// the workforce, reimagined</div>
           <p className="font-display font-medium text-3xl lg:text-4xl tracking-tighter leading-tight">
-            "We deployed our customer support agent on a Tuesday. By Friday it had handled 412 conversations and one human refund."
+            &ldquo;We deployed our customer support agent on a Tuesday. By Friday it had handled 412 conversations and one human refund.&rdquo;
           </p>
           <div className="mt-8 font-mono text-xs text-white/60">— Head of CX, Northwind</div>
         </div>
