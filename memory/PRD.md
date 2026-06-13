@@ -24,6 +24,12 @@ QuotientIQ — an Enterprise AI Employee Marketplace ("App Store for AI Employee
 - Per-user seeded support agent on registration
 - Backend regression test suite (18 tests)
 
+### V4 — shipped 2026-06-13
+- **Conversations explorer**: `/conversations` page lists all threads (internal + embedded) with agent name, customer/visitor, last message preview, msg count, timestamp, EMBED badge for embed-sourced threads. Filters: by agent, by source (internal/embed). Client-side search. Per-row Export (JSON download) + Delete actions. Backend: `GET /api/conversations` (with agent_id/source filters, joins agent metadata, computes message_count via aggregate), `GET /api/conversations/{id}/export`, `DELETE /api/conversations/{id}`.
+- **Markdown rendering** in chat: assistant messages now render `react-markdown + remark-gfm` (tables, lists, code blocks, bold/italic, links, headings, blockquotes, hr). Active in both authenticated `/chat` and public `/embed/:token`. User messages stay plain text.
+- **Embed rate-limiting**: per-token (200/hour) and per-visitor (40/hour) sliding-window enforcement on `POST /api/embed/{token}/chat`. Backed by `embed_hits` collection with a TTL index (`expireAfterSeconds=3600`) for self-cleanup.
+- Backend tests expanded to 47 (100% passing).
+
 ### V3 — shipped 2026-06-13
 - **Stripe Billing (Layer 20)**: `/billing` page with 3 tiers (Starter $99 / Pro $299 highlighted / Enterprise contact-sales). `/api/billing/checkout`, `/api/billing/status/{sid}`, `/api/billing/me`, `/api/webhook/stripe`. Uses Emergent's `sk_test_emergent` Stripe test key. `payment_transactions` collection logs every session; user.plan flips to paid tier on success.
 - **Multi-agent delegation (Layer 10 full)**: Team-aware system prompt instructs the LLM to emit `[DELEGATE: <agent> | <question>]` markers. Backend parses (max 2/turn), runs `_run_delegation` to call the target agent's chat with the same memory/team context, and stitches `— **Asked <agent>**: ...` blocks into the streamed reply. Works in both SSE `/chat` and JSON `/chat-sync`.
