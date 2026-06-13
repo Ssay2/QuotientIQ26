@@ -763,3 +763,139 @@ class TestWidgetLoader:
         # Mentions data-quotientiq-token attribute that EmbedSection emits
         assert "quotientiq" in body.lower()
 
+
+
+# -------- V4: Conversations Explorer --------
+class TestConversationsExplorer:
+    def test_list_conversations_basic_and_filters(self, fresh_user_client):
+        # Create an agent
+        r = fresh_user_client.post(f"{API}/agents", json={"name": "ConvTestAgent", "instructions": "Reply hi.", "icon": "Bot", "category": "Customer Service"})
+        assert r.status_code == 200
+        agent_id = r.json()["id"]
+        # Create a conversation via chat-sync (LLM call may take a few seconds)
+        r = fresh_user_client.post(f"{API}/agents/{agent_id}/chat-sync", json={"message": "Hello", "customer_name": "Alice"}, timeout=120)
+        assert r.status_code == 200, r.text
+        conv_id = r.json()["conversation_id"]
+
+        # List
+        r = fresh_user_client.get(f"{API}/conversations")
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert "conversations" in data and isinstance(data["conversations"], list)
+        assert data["count"] >= 1
+        # Find our conv
+        ours = [c for c in data["conversations"] if c["id"] == conv_id]
+        assert len(ours) == 1, f"Expected our conv in list, got: {data['conversations']}"
+        c = ours[0]
+        for field in ("id", "agent_id", "customer_name", "source", "updated_at", "created_at", "last_role", "last_preview", "message_count", "agent"):
+            assert field in c, f"Missing {field}"
+        assert c["customer_name"] == "Alice"
+        assert c["message_count"] >= 1
+        assert c["agent"] is not None and c["agent"]["name"] == "ConvTestAgent"
+        assert len(c["last_preview"]) <= 160
+
+        # agent_id filter
+        r = fresh_user_client.get(f"{API}/conversations", params={"agent_id": agent_id})
+        assert r.status_code == 200
+        assert all(c["agent_id"] == agent_id for c in r.json()["conversations"])
+
+        # unknown source returns empty
+        r = fresh_user_client.get(f"{API}/conversations", params={"source": "nonexistent_xyz"})
+        assert r.status_code == 200
+        assert r.json()["conversations"] == []
+
+    def test_export_conversation(self, fresh_user_client):
+        r = fresh_user_client.post(f"{API}/agents", json={"name": "ExportAgent", "instructions": "ok"})
+        agent_id = r.json()["id"]
+        r = fresh_user_client.post(f"{API}/agents/{agent_id}/chat-sync", json={"message": "ping"}, timeout=120)
+        conv_id = r.json()["conversation_id"]
+        r = fresh_user_client.get(f"{API}/conversations/{conv_id}/export")
+        assert r.status_code == 200
+        d = r.json()
+        assert d["id"] == conv_id
+        assert "messages" in d and len(d["messages"]) >= 1
+        # 404 for non-existent
+        from bson import ObjectId
+        r2 = fresh_user_client.get(f"{API}/conversations/{ObjectId()}/export")
+        assert r2.status_code == 404
+
+    def test_delete_conversation_and_isolation(self, fresh_user_client, admin_client):
+        # Create conv for fresh user
+        r = fresh_user_client.post(f"{API}/agents", json={"name": "DelAgent"})
+        agent_id = r.json()["id"]
+        r = fresh_user_client.post(f"{API}/agents/{agent_id}/chat-sync", json={"message": "hi"}, timeout=120)
+        conv_id = r.json()["conversation_id"]
+
+        # Admin (different user) cannot delete
+        r = admin_client.delete(f"{API}/conversations/{conv_id}")
+        assert r.status_code == 404
+
+        # Owner deletes
+        r = fresh_user_client.delete(f"{API}/conversations/{conv_id}")
+        assert r.status_code == 200
+        # Verify gone
+        r = fresh_user_client.get(f"{API}/conversations/{conv_id}/export")
+        assert r.status_code == 404
+        # Second delete returns 404
+        r = fresh_user_client.delete(f"{API}/conversations/{conv_id}")
+        assert r.status_code == 404
+
+
+# -------- V4: Embed rate limiting --------
+class TestEmbedRateLimit:
+    def test_per_visitor_40_then_429_other_visitor_ok(self, fresh_user_client):
+        # Fresh agent to avoid clobbering existing embed_token
+        r = fresh_user_client.post(f"{API}/agents", json={"name": "RateLimitAgent", "instructions": "Always reply with the single word: ok"})
+        agent_id = r.json()["id"]
+        r = fresh_user_client.post(f"{API}/agents/{agent_id}/embed-enable")
+        assert r.status_code == 200
+        token = r.json()["embed_token"]
+
+        # Clean any stale hits for this token
+        # We can't access mongo directly here; instead use a unique visitor_id per test
+        v1 = f"v_test_{uuid.uuid4().hex[:8]}"
+        v2 = f"v_test_{uuid.uuid4().hex[:8]}"
+
+        # Send 40 requests for v1. Use plain requests (no auth) since /embed is public.
+        # Skip the LLM call by patching? No — we must hit the real endpoint. 40 LLM calls is expensive.
+        # Instead, increment by inserting embed_hits directly is not possible from test, so we send real requests.
+        # To keep this within reasonable time, we send 40 minimal messages.
+        ok_count = 0
+        last_status = None
+        for i in range(40):
+            rr = requests.post(f"{API}/embed/{token}/chat", json={"message": "ok", "visitor_id": v1}, timeout=120)
+            last_status = rr.status_code
+            if rr.status_code == 200:
+                ok_count += 1
+            else:
+                # If we hit an unexpected error early, fail fast
+                pytest.fail(f"Request {i+1} for v1 failed: {rr.status_code} {rr.text[:200]}")
+        assert ok_count == 40, f"Expected 40 OK, got {ok_count}"
+
+        # 41st request for v1 should be 429
+        rr = requests.post(f"{API}/embed/{token}/chat", json={"message": "ok", "visitor_id": v1}, timeout=30)
+        assert rr.status_code == 429, f"Expected 429 for v1's 41st, got {rr.status_code}: {rr.text[:200]}"
+
+        # Different visitor still works (proves per-visitor scoping)
+        rr = requests.post(f"{API}/embed/{token}/chat", json={"message": "ok", "visitor_id": v2}, timeout=120)
+        assert rr.status_code == 200, f"Different visitor should still work, got {rr.status_code}: {rr.text[:200]}"
+
+
+# -------- V4: TTL index on embed_hits --------
+class TestEmbedHitsTTL:
+    def test_ttl_index_exists(self):
+        """Verify TTL index on embed_hits.ts_dt with expireAfterSeconds=3600."""
+        from pymongo import MongoClient
+        mongo_url = os.environ.get("MONGO_URL")
+        db_name = os.environ.get("DB_NAME")
+        if not mongo_url or not db_name:
+            pytest.skip("MONGO_URL/DB_NAME not available to inspect indexes")
+        client = MongoClient(mongo_url)
+        try:
+            db = client[db_name]
+            indexes = list(db.embed_hits.list_indexes())
+            ttl = [i for i in indexes if i.get("expireAfterSeconds") is not None and "ts_dt" in i.get("key", {})]
+            assert ttl, f"No TTL index on embed_hits.ts_dt. Indexes: {indexes}"
+            assert ttl[0]["expireAfterSeconds"] == 3600, f"Expected TTL=3600, got {ttl[0]['expireAfterSeconds']}"
+        finally:
+            client.close()

@@ -2,11 +2,12 @@ import React from "react";
 import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
-import { LayoutGrid, Store, Wrench, BarChart3, LogOut, Sparkles, Brain, Network, CreditCard } from "lucide-react";
+import { LayoutGrid, Store, Wrench, BarChart3, LogOut, Sparkles, Brain, Network, CreditCard, MessageSquare } from "lucide-react";
 
 const NAV = [
   { to: "/dashboard", label: "Dashboard", icon: LayoutGrid, tid: "nav-dashboard" },
   { to: "/marketplace", label: "Marketplace", icon: Store, tid: "nav-marketplace" },
+  { to: "/conversations", label: "Conversations", icon: MessageSquare, tid: "nav-conversations" },
   { to: "/org", label: "Org Chart", icon: Network, tid: "nav-org" },
   { to: "/profile", label: "Memory", icon: Brain, tid: "nav-profile" },
   { to: "/builder", label: "Builder", icon: Wrench, tid: "nav-builder" },

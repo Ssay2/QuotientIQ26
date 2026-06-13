@@ -14,6 +14,7 @@ import Builder from "@/pages/Builder";
 import Analytics from "@/pages/Analytics";
 import Billing from "@/pages/Billing";
 import Embed from "@/pages/Embed";
+import Conversations from "@/pages/Conversations";
 import CompanyProfile from "@/pages/CompanyProfile";
 import OrgChart from "@/pages/OrgChart";
 
@@ -40,6 +41,7 @@ export default function App() {
           <Route path="/profile" element={<Protected><CompanyProfile /></Protected>} />
           <Route path="/org" element={<Protected><OrgChart /></Protected>} />
           <Route path="/billing" element={<Protected><Billing /></Protected>} />
+          <Route path="/conversations" element={<Protected><Conversations /></Protected>} />
           <Route path="/embed/:token" element={<Embed />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

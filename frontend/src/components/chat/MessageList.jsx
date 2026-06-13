@@ -1,4 +1,5 @@
 import React from "react";
+import { MarkdownMessage } from "@/components/chat/MarkdownMessage";
 
 function EmptyState({ Icon, agentName, hasKb }) {
   return (
@@ -21,13 +22,20 @@ function EmptyState({ Icon, agentName, hasKb }) {
 
 function MessageBubble({ message, busy, index }) {
   const isUser = message.role === "user";
+  const showThinking = busy && !isUser && !message.content;
   return (
     <div className={`max-w-2xl ${isUser ? "ml-auto" : ""}`}>
       <div
-        className={`rounded-md p-4 text-sm whitespace-pre-wrap ${isUser ? "bubble-user" : "bubble-ai"}`}
+        className={`rounded-md p-4 text-sm ${isUser ? "bubble-user whitespace-pre-wrap" : "bubble-ai"}`}
         data-testid={`msg-${message.role}-${index}`}
       >
-        {message.content || (busy && !isUser ? <span className="font-mono text-xs">thinking…</span> : null)}
+        {showThinking ? (
+          <span className="font-mono text-xs">thinking…</span>
+        ) : isUser ? (
+          message.content
+        ) : (
+          <MarkdownMessage content={message.content || ""} />
+        )}
       </div>
     </div>
   );

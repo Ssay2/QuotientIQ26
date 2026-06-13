@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import axios from "axios";
 import { Send, Sparkles, Loader2, X } from "lucide-react";
+import { MarkdownMessage } from "@/components/chat/MarkdownMessage";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
@@ -79,8 +80,8 @@ export default function Embed() {
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-3" data-testid="embed-messages">
         {messages.map((m, i) => (
           <div key={i} className={`max-w-[85%] ${m.role === "user" ? "ml-auto" : ""}`}>
-            <div className={`rounded-md p-3 text-sm whitespace-pre-wrap ${m.role === "user" ? "bubble-user" : "bubble-ai"}`}>
-              {m.content}
+            <div className={`rounded-md p-3 text-sm ${m.role === "user" ? "bubble-user whitespace-pre-wrap" : "bubble-ai"}`}>
+              {m.role === "user" ? m.content : <MarkdownMessage content={m.content} />}
             </div>
           </div>
         ))}

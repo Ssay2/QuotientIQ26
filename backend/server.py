@@ -51,6 +51,11 @@ BILLING_PLANS = {
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW_SECONDS = 900  # 15 minutes
 
+# Embed (public widget) rate limits
+EMBED_TOKEN_MAX_PER_HOUR = 200
+EMBED_VISITOR_MAX_PER_HOUR = 40
+EMBED_WINDOW_SECONDS = 3600
+
 # ---------------- Validation Helpers ----------------
 def to_object_id(value: str, label: str = "id") -> ObjectId:
     """Convert a string to ObjectId or raise HTTP 400."""
@@ -966,13 +971,29 @@ async def embed_get_agent(token: str):
     }
 
 @api.post("/embed/{token}/chat")
-async def embed_chat(token: str, body: EmbedChatIn):
+async def embed_chat(token: str, body: EmbedChatIn, request: Request):
     agent = await db.agents.find_one({"embed_token": token, "embed_enabled": True})
     if not agent:
         raise HTTPException(404, "Embed not found")
     user_id = agent["user_id"]
     agent_id = str(agent["_id"])
     visitor = body.visitor_id or f"v_{secrets.token_hex(6)}"
+
+    # Per-token + per-visitor rate limiting (public endpoint).
+    now_dt = datetime.now(timezone.utc)
+    window_start_iso = (now_dt - timedelta(seconds=EMBED_WINDOW_SECONDS)).isoformat()
+    token_recent = await db.embed_hits.count_documents({"token": token, "ts": {"$gte": window_start_iso}})
+    if token_recent >= EMBED_TOKEN_MAX_PER_HOUR:
+        raise HTTPException(429, "This chat is temporarily over its hourly limit. Try again later.")
+    visitor_recent = await db.embed_hits.count_documents({"token": token, "visitor": visitor, "ts": {"$gte": window_start_iso}})
+    if visitor_recent >= EMBED_VISITOR_MAX_PER_HOUR:
+        raise HTTPException(429, "Too many messages — please pause for a moment.")
+    await db.embed_hits.insert_one({
+        "token": token,
+        "visitor": visitor,
+        "ts": now_dt.isoformat(),
+        "ts_dt": now_dt,
+    })
 
     # Build/find a per-visitor conversation thread
     conv = await db.conversations.find_one({"agent_id": agent_id, "user_id": user_id, "customer_name": visitor})
@@ -994,16 +1015,87 @@ async def embed_chat(token: str, body: EmbedChatIn):
         elif isinstance(ev, StreamDone):
             break
 
-    cleaned, _ = _parse_delegations(full)
+    # Execute delegations (mirrors the authenticated chat path).
+    cleaned, delegations = _parse_delegations(full)
+    final_text = cleaned or full
+    for d in delegations[:2]:
+        result = await _run_delegation(user_id, agent_id, d["agent"], d["question"])
+        if result.get("ok"):
+            final_text += f"\n\n— **Asked {result['agent']}**: {d['question']}\n{result['reply']}"
+
     now = now_iso()
     await db.conversations.update_one(
         {"_id": to_object_id(conv_id, "conversation id")},
         {"$push": {"messages": {"$each": [
             {"role": "user", "content": body.message, "timestamp": now},
-            {"role": "assistant", "content": cleaned or full, "timestamp": now},
+            {"role": "assistant", "content": final_text, "timestamp": now},
         ]}}, "$set": {"updated_at": now}},
     )
-    return {"reply": cleaned or full, "visitor_id": visitor}
+    return {"reply": final_text, "visitor_id": visitor}
+
+# ---------------- Conversations Explorer ----------------
+@api.get("/conversations")
+async def list_all_conversations(agent_id: Optional[str] = None, source: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query: dict = {"user_id": user["id"]}
+    if agent_id:
+        query["agent_id"] = agent_id
+    if source:
+        query["source"] = source
+
+    cursor = db.conversations.find(query, {"messages": {"$slice": -1}}).sort("updated_at", -1).limit(200)
+    out = []
+    async for c in cursor:
+        last_msg = (c.get("messages") or [{}])[-1] if c.get("messages") else {}
+        out.append({
+            "id": str(c.pop("_id")),
+            "agent_id": c.get("agent_id"),
+            "customer_name": c.get("customer_name", "Guest"),
+            "source": c.get("source", "internal"),
+            "updated_at": c.get("updated_at"),
+            "created_at": c.get("created_at"),
+            "last_role": last_msg.get("role"),
+            "last_preview": (last_msg.get("content") or "")[:160],
+        })
+
+    # Also count total messages for each conversation in a single follow-up query
+    if out:
+        counts_cursor = db.conversations.aggregate([
+            {"$match": query},
+            {"$project": {"_id": 1, "n": {"$size": {"$ifNull": ["$messages", []]}}}},
+        ])
+        counts = {str(c["_id"]): c["n"] async for c in counts_cursor}
+        for o in out:
+            o["message_count"] = counts.get(o["id"], 0)
+
+    # Attach agent name
+    agent_ids = {o["agent_id"] for o in out if o.get("agent_id")}
+    if agent_ids:
+        agents = await db.agents.find(
+            {"_id": {"$in": [to_object_id(aid, "agent id") for aid in agent_ids if ObjectId.is_valid(aid)]}},
+            {"name": 1, "icon": 1, "category": 1},
+        ).to_list(500)
+        amap = {str(a["_id"]): {"name": a.get("name"), "icon": a.get("icon"), "category": a.get("category")} for a in agents}
+        for o in out:
+            o["agent"] = amap.get(o["agent_id"])
+
+    return {"conversations": out, "count": len(out)}
+
+@api.get("/conversations/{conv_id}/export")
+async def export_conversation(conv_id: str, user: dict = Depends(get_current_user)):
+    c = await db.conversations.find_one({"_id": to_object_id(conv_id, "conversation id"), "user_id": user["id"]})
+    if not c:
+        raise HTTPException(404, "Conversation not found")
+    c["id"] = str(c.pop("_id"))
+    return c
+
+@api.delete("/conversations/{conv_id}")
+async def delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
+    result = await db.conversations.delete_one(
+        {"_id": to_object_id(conv_id, "conversation id"), "user_id": user["id"]}
+    )
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Conversation not found")
+    return {"ok": True}
 
 @api.get("/")
 async def root():
@@ -1039,6 +1131,11 @@ async def startup():
     await db.login_attempts.create_index("identifier")
     await db.payment_transactions.create_index("session_id", unique=True)
     await db.payment_transactions.create_index("user_id")
+    try:
+        await db.embed_hits.create_index("ts_dt", expireAfterSeconds=EMBED_WINDOW_SECONDS)
+    except Exception:
+        pass
+    await db.embed_hits.create_index([("token", 1), ("visitor", 1)])
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@quotientiq.com").lower()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")
