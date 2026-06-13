@@ -1,0 +1,47 @@
+{
+  "summary": "First iteration end-to-end test of QuotientIQ MVP. Backend: 18/18 pytest tests passed (auth, agents CRUD, marketplace, PDF upload, GPT-5.2 chat-sync, conversation persistence, analytics, seeded admin + new-user agents). Frontend: All critical flows working — landing, register, login, dashboard, marketplace install, builder, chat (with streaming), PDF upload UI, analytics, logout, and protected route redirect. One streaming display bug found: assistant tokens appear duplicated in the chat UI (e.g. 'HiHi there there,, welcome welcome!!').",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/agents/{id}", "issue": "PATCH replaces entire document via AgentIn model_dump — if client omits a field it would reset to default. Consider partial update with exclude_unset=True."},
+      {"endpoint": "/api/agents/{id} (DELETE)", "issue": "Returns 200 with {ok:true} regardless of whether agent existed. Consider 404 when not found for stricter semantics."},
+      {"endpoint": "/api/auth/login", "issue": "No brute-force lockout / rate limiting on login attempts (auth_testing.md mentions 5-attempt lockout)."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Chat.jsx (SSE streaming handler)", "issue": "Assistant reply text is duplicated in the UI bubble (e.g. 'HiHi there there,, welcome welcome!!'). Likely each SSE TextDelta chunk is being appended to the displayed message twice — possibly because event 'data:' lines are parsed twice or React state is updated for both the streaming buffer and a final flush. Backend chat-sync returns clean text; backend persistence is correct. Bug is purely in the frontend SSE accumulator.", "selector": "chat message bubble", "priority": "HIGH"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Dashboard", "issues": ["Section header is '// MY WORKFORCE' + 'Welcome, {name}.' rather than the literal 'My AI Workforce' specified in the brief. Cosmetic — acceptable but flagged for parity with PRD."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Fix Chat.jsx SSE stream handler: assistant message text is being duplicated. Inspect the EventSource/fetch-stream onmessage callback — likely appending the same delta to both a buffer and the visible state, or running the parser twice per chunk.",
+    "(Optional) Add brute-force/lockout to /api/auth/login per auth_testing.md guidance.",
+    "(Optional) Make PATCH /api/agents/{id} a partial update so omitted fields are not reset."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 543 lines but still manageable; consider splitting into routers (auth, agents, chat, marketplace, analytics) once feature set grows.",
+    "ObjectId access via ObjectId(agent_id) is not wrapped in try/except — a malformed id in URL will raise 500 instead of 400/404. Add a helper to validate ids.",
+    "/api/agents PATCH uses AgentIn (full body) — partial updates not supported.",
+    "Chat SSE: no per-user/agent concurrency cap; long replies could pile up. Acceptable for MVP.",
+    "CORS allow_origins=['*'] with allow_credentials=True is permissive — fine for preview but tighten to FRONTEND_URL for production.",
+    "Knowledge text capped at 200k chars on disk but only 30k chars sent into LLM prompt — fine, but consider chunked retrieval / embeddings post-MVP."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py (new)"
+  ],
+  "success_rate": {"backend": "100% (18/18)", "frontend": "~92% (one streaming display bug)"},
+  "test_credentials": "Admin admin@quotientiq.com / admin123 works. Auto-registered E2E users via UI/API also work.",
+  "seed_data_creation": "Created multiple TEST_-prefixed agents and several disposable users (e2e_*@quotientiq.com, test_*@quotientiq.com) during testing. Agents created during CRUD test were deleted; users + leftover seeded agents remain in DB (harmless).",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend regression suite at /app/backend/tests/backend_test.py covers auth, agents CRUD, marketplace, PDF upload, sync chat, conversations, analytics. Run with: pytest /app/backend/tests/backend_test.py -v. Frontend critical bug: chat streaming duplicates tokens in UI. After main agent fixes Chat.jsx, retest by sending a message in /chat/{agent_id} and verifying assistant reply is not doubled.",
+  "rca of the issue": "Chat streaming duplication: Backend /api/agents/{id}/chat is correctly emitting one SSE 'data:' frame per TextDelta and persisting the final accumulated text correctly (verified via /chat-sync which returns clean text). The duplication only appears in the rendered chat bubble, so the bug is in the frontend SSE consumer in Chat.jsx. Likely causes: (1) onmessage callback fires twice due to subscription being set up in an effect without cleanup; (2) the parsed text is appended to both a per-frame buffer and a state setter that already includes the buffer; (3) the same chunk is being concatenated to itself due to React strict mode double-invocation of effects in dev. Mitigation: ensure the EventSource/reader is created once per send, accumulate text in a single ref, and setState(streamingRef.current) — do not append the same delta to two places."
+}
