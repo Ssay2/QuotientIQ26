@@ -218,7 +218,11 @@ async def login(body: LoginIn, request: Request, response: Response):
 
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(body.password, user["password_hash"]):
-        await db.login_attempts.insert_one({"identifier": identifier, "ts": now_iso()})
+        await db.login_attempts.insert_one({
+            "identifier": identifier,
+            "ts": now_iso(),
+            "ts_dt": datetime.now(timezone.utc),
+        })
         raise HTTPException(401, "Invalid email or password")
 
     # Success — clear attempts.
@@ -626,15 +630,25 @@ async def chat_sync(agent_id: str, body: ChatMessageIn, user: dict = Depends(get
         elif isinstance(ev, StreamDone):
             break
 
+    # Execute any delegations the model requested, mirroring event_stream().
+    cleaned, delegations = _parse_delegations(full)
+    final_text = cleaned or full
+    for d in delegations[:2]:
+        result = await _run_delegation(user["id"], agent_id, d["agent"], d["question"])
+        if result.get("ok"):
+            final_text += f"\n\n— **Asked {result['agent']}**: {d['question']}\n{result['reply']}"
+        else:
+            final_text += f"\n\n_({result.get('error', 'Could not reach teammate')})_"
+
     now = now_iso()
     await db.conversations.update_one(
         {"_id": to_object_id(conv_id, "conversation id")},
         {"$push": {"messages": {"$each": [
             {"role": "user", "content": body.message, "timestamp": now},
-            {"role": "assistant", "content": full, "timestamp": now},
+            {"role": "assistant", "content": final_text, "timestamp": now},
         ]}}, "$set": {"updated_at": now}},
     )
-    return {"conversation_id": conv_id, "reply": full}
+    return {"conversation_id": conv_id, "reply": final_text}
 
 # ---------------- Analytics ----------------
 @api.get("/analytics/summary")
@@ -1017,6 +1031,11 @@ async def startup():
     await db.agents.create_index("embed_token", sparse=True)
     await db.conversations.create_index([("user_id", 1), ("agent_id", 1)])
     await db.company_profiles.create_index("user_id", unique=True)
+    # TTL index — expire stale login attempts automatically so the collection can't grow unbounded.
+    try:
+        await db.login_attempts.create_index("ts_dt", expireAfterSeconds=LOGIN_WINDOW_SECONDS)
+    except Exception:
+        pass  # index may already exist with different options
     await db.login_attempts.create_index("identifier")
     await db.payment_transactions.create_index("session_id", unique=True)
     await db.payment_transactions.create_index("user_id")

@@ -24,6 +24,13 @@ QuotientIQ — an Enterprise AI Employee Marketplace ("App Store for AI Employee
 - Per-user seeded support agent on registration
 - Backend regression test suite (18 tests)
 
+### V3 — shipped 2026-06-13
+- **Stripe Billing (Layer 20)**: `/billing` page with 3 tiers (Starter $99 / Pro $299 highlighted / Enterprise contact-sales). `/api/billing/checkout`, `/api/billing/status/{sid}`, `/api/billing/me`, `/api/webhook/stripe`. Uses Emergent's `sk_test_emergent` Stripe test key. `payment_transactions` collection logs every session; user.plan flips to paid tier on success.
+- **Multi-agent delegation (Layer 10 full)**: Team-aware system prompt instructs the LLM to emit `[DELEGATE: <agent> | <question>]` markers. Backend parses (max 2/turn), runs `_run_delegation` to call the target agent's chat with the same memory/team context, and stitches `— **Asked <agent>**: ...` blocks into the streamed reply. Works in both SSE `/chat` and JSON `/chat-sync`.
+- **Brute-force lockout (P0 hardening)**: 5 failed logins per email within 15-min window → HTTP 429. Uses `login_attempts` collection with TTL index for self-cleanup. Email-only identifier (ingress-IP agnostic).
+- **Website Embed Widget (Layer 25)**: `/api/agents/{id}/embed-enable|disable` mint a public token; public `/api/embed/{token}/agent` + `/api/embed/{token}/chat` endpoints (no auth). Customer-facing `/embed/:token` page is a self-contained chat UI. Drop-in `/widget.js` injects a floating button that opens the chat in an iframe — `<script src=".../widget.js" data-quotientiq-token="..." defer></script>`. Per-visitor conversation persistence.
+- Backend tests expanded to 42 (100% passing).
+
 ### V2 — shipped 2026-06-13
 - **Memory / Company Profile (Layer 9)**: `/profile` page; 7 structured fields (company_name, audience, products, services, pricing, brand_voice, policies); auto-injected into every agent's system prompt
 - **AI Org Chart (Layer 11)**: `/org` page with hierarchical tree; `parent_agent_id` on agents; reparent via dropdown; **cycle detection** on the server (multi-hop loops blocked)
