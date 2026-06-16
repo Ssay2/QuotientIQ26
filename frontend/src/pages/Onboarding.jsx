@@ -41,19 +41,24 @@ export default function Onboarding() {
     (async () => {
       try {
         const [prof, st, inds] = await Promise.all([
-          api.get("/company-profile"),
-          api.get("/onboarding/status"),
-          api.get("/industries"),
+          api.get("/company-profile").catch(() => ({ data: {} })),
+          api.get("/onboarding/status").catch(() => ({ data: {} })),
+          api.get("/industries").catch(() => ({ data: [] })),
         ]);
         if (c) return;
         setProfile((p) => ({ ...p, ...(prof.data || {}) }));
         setIndustries(inds.data || []);
-        if (st.data?.completed) nav("/dashboard");
-        else if (st.data?.current_step) setStep(Math.min(6, st.data.current_step));
-      } catch (err) { /* noop */ }
+        // Pick up where the user left off, but never auto-redirect away —
+        // they can always use the explicit "Skip for now" button to leave.
+        if (st.data?.current_step && !st.data?.completed) {
+          setStep(Math.min(6, Math.max(1, st.data.current_step)));
+        }
+      } catch (err) {
+        // silently degrade — wizard still shows defaults
+      }
     })();
     return () => { c = true; };
-  }, [nav]);
+  }, []);
 
   const persist = async (next, extra = {}) => {
     try {

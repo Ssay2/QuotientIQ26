@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useRef } from "react";
 import "@/App.css";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/lib/auth";
@@ -35,8 +35,15 @@ import { NotFound, Forbidden, ServerError, Maintenance } from "@/pages/Errors";
 
 function PublicOnly({ children }) {
   const { user, loading } = useAuth();
+  // Snapshot the auth state at MOUNT time only.
+  // Without this, post-login state updates trigger a Navigate that wins the
+  // race against the page's own imperative nav() (e.g. Register navs to /onboarding).
+  const initiallyAuthed = useRef(null);
+  if (initiallyAuthed.current === null && !loading) {
+    initiallyAuthed.current = !!user;
+  }
   if (loading) return null;
-  if (user) return <Navigate to="/dashboard" replace />;
+  if (initiallyAuthed.current) return <Navigate to="/dashboard" replace />;
   return children;
 }
 

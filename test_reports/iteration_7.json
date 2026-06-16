@@ -1,0 +1,40 @@
+{
+  "summary": "Iteration 7 micro-regression verified. The two HIGH-priority bugs from iteration_6 are FIXED: (1) Register \u2192 /onboarding redirect now lands cleanly on step 1 of the 6-step wizard (no longer bounces to /dashboard); (2) GlobalSearch Cmd+K dialog no longer emits the 'DialogContent requires a DialogTitle' a11y warning (sr-only DialogTitle + DialogDescription confirmed in /app/frontend/src/components/GlobalSearch.jsx lines 83-86). End-to-end flows verified: fresh register \u2192 onboarding step 1; full wizard step 1 \u2192 6 (with industry skip + file upload skip) completes and 'Open my workforce' navigates to /chat/:agentId; 'Skip for now' button hits POST /api/onboarding/skip and navs to /dashboard; PublicOnly mount-snapshot correctly redirects already-logged-in users from /login and /register \u2192 /dashboard. Backend regression: ALL 91 backend tests pass (66 V1-V5 + 25 V6, +1 skipped which is a DEV_MODE-only path \u2014 unchanged from iteration_6). Additional UI checks: Theme toggle dark\u2194light persists in localStorage qiq-theme and toggles .dark class on <html>; Departments CRUD (create with multi-agent checkbox \u2192 list renders new card with toast); Chief of Staff /api/chief/route returns 2232-char reply with 1 delegation in ~45s; Global Search returns 9 results in 245ms across agents + conversations; Error pages /nonexistent (404), /403, /500, /maintenance all render. Reload on /onboarding keeps user on /onboarding (state persists via backend status).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "PUT /api/departments/{id}", "issue": "Still requires full DepartmentIn body; no PATCH for partial updates. Carried over from iteration_6 \u2014 cosmetic."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_v6_features.py",
+    "/app/test_reports/pytest/iter7_results.xml"
+  ],
+  "action_items": [
+    "OPTIONAL (carried over): Modularize server.py (2228 lines) into routers (departments, chief, notifications, onboarding, search, integrations).",
+    "OPTIONAL (carried over): Add PATCH support on /api/departments/{id} or relax DepartmentIn to allow partial updates.",
+    "OPTIONAL (carried over): Soft-delete API keys (active=false) instead of hard delete.",
+    "OPTIONAL (carried over): Fire create_notification on conversation insert for the 'new_conversations' notification setting to actually have side effects."
+  ],
+  "critical_code_review_comments": [
+    "PublicOnly's useRef mount-snapshot is a clean, minimal fix \u2014 it preserves initial-mount redirect for already-authed users while suppressing post-setUser re-render redirects that previously raced with imperative nav(). Tested both directions (logged-out \u2192 register lands on /onboarding; logged-in visiting /login or /register \u2192 /dashboard) and both behaviors are correct.",
+    "Onboarding.jsx useEffect no longer auto-redirects on completed=true (line 53-55 only adjusts step). 'Skip for now' is the only path out of the wizard. This is the intended UX per problem statement.",
+    "GlobalSearch DialogTitle is sr-only \u2014 confirmed zero radix DialogTitle warnings in console after Cmd+K open/type/escape.",
+    "Frontend NotificationBell uses data-testid='notif-bell' on the inner button (NOT 'notification-bell'). Spec in iteration_6 said 'notification-bell' \u2014 update docs OR rename testid for consistency. Bell badge visually shows '1' on admin dashboard, so unread count IS rendering.",
+    "Chief of Staff page uses data-testid='chief-route-btn' and 'chief-task' (NOT 'chief-submit'/'chief-input'). Just a doc-vs-impl mismatch."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (91/91 executed, 1 conditional skip for DEV_MODE-only path)", "frontend": "100% on all features in scope of this micro-iteration (register\u2192onboarding, full wizard, skip, PublicOnly, GlobalSearch a11y, theme, departments, error pages, chief)"},
+  "test_credentials": "admin@quotientiq.com / admin123 (from /app/memory/test_credentials.md). Test created ephemeral users: obtest_<ts>, obfull_<ts>, skiptest_<ts>.",
+  "seed_data_creation": "Created 3 ephemeral test users via /api/auth/register + 1 ephemeral department (TestDept_1781576067) and 1 ephemeral agent (TestAgentOB) during UI tests. Non-blocking.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Both iteration_6 HIGH bugs are FIXED and verified end-to-end. PublicOnly mount-snapshot pattern (App.js lines 36-48) is the canonical fix \u2014 do NOT replace with a stateful check, it will re-introduce the redirect race. Onboarding.jsx must NEVER auto-redirect on completed; only the explicit skip button navigates away. Frontend testids confirmed: ob-company, ob-audience, ob-services, ob-industry-{id}, ob-next-1..5, ob-back, ob-agent-name/role/instructions, ob-file, ob-finish, onboarding-skip, theme-toggle, notif-bell (NOT notification-bell), global-search-dialog, global-search-input, search-result-{i}, chief-task, chief-route-btn, chief-reply, dept-{deptName}. Backend run: ADMIN_PASSWORD=admin123 ADMIN_EMAIL=admin@quotientiq.com pytest /app/backend/tests/ -v \u2014 takes ~125s, 91 pass + 1 skip.",
+  "rca_of_the_issue": "Original RCA: PublicOnly re-rendered after Register called setUser() (AuthContext update) and emitted a <Navigate to='/dashboard'> that won the race against Register's imperative nav('/onboarding'). FIX (in /app/frontend/src/App.js): PublicOnly now snapshots `!!user` into useRef on first non-loading render and reads from the ref thereafter \u2014 so it never re-renders a <Navigate> after the initial mount decision. Verified: (a) fresh registrant lands and stays on /onboarding through reload; (b) already-logged-in user visiting /login or /register still gets redirected to /dashboard (initial-mount path preserved). GlobalSearch a11y fix: added <DialogTitle className='sr-only'>Global search</DialogTitle> and <DialogDescription className='sr-only'>...</DialogDescription> inside <DialogContent>. Zero radix warnings now."
+}

@@ -17,7 +17,7 @@ import {
   DollarSign,
   Crown,
 } from "lucide-react";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 
 const ICON = {
   MessageSquare, FileText, BookOpen, Users, Sparkles, Headphones,
@@ -80,6 +80,10 @@ export default function GlobalSearch({ open, onOpenChange }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="p-0 max-w-xl gap-0 overflow-hidden" data-testid="global-search-dialog">
+        <DialogTitle className="sr-only">Global search</DialogTitle>
+        <DialogDescription className="sr-only">
+          Search across agents, conversations, knowledge base documents, and team members.
+        </DialogDescription>
         <div className="flex items-center gap-3 px-4 h-14 border-b border-border">
           <SearchIcon className="size-4 text-muted-foreground" strokeWidth={1.5} />
           <input

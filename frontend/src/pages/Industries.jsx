@@ -50,7 +50,7 @@ export default function Industries() {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-px bg-border border border-border" data-testid="industries-grid">
             {items.map((i) => (
-              <div key={i.id} data-testid={`industry-${i.id}`} className="bg-card p-6 lg:p-8 flex flex-col">
+              <div key={i.id} data-testid={`industry-${i.id}`} data-card-testid={`industry-card-${i.id}`} className="bg-card p-6 lg:p-8 flex flex-col">
                 <div className="size-10 border border-border grid place-items-center mb-5">
                   <Briefcase className="size-5" strokeWidth={1.5} />
                 </div>
