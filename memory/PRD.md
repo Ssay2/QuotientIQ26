@@ -1,97 +1,84 @@
 # QuotientIQ — PRD
 
 ## Original Problem Statement
-QuotientIQ — an Enterprise AI Employee Marketplace ("App Store for AI Employees"). Long-term vision: a 40-layer operating system for AI employees that businesses log into to manage an entire digital workforce that collaborates, learns, and automates across departments.
+QuotientIQ — an Enterprise AI Employee Marketplace ("App Store for AI Employees"). Long-term vision: a 40-layer operating system for AI employees that businesses log into to manage an entire digital workforce that collaborates, learns, and automates across departments. The product should feel like an **AI Operating System**, not a chatbot.
 
 ## Architecture
-- **Frontend**: React (CRA) + TailwindCSS + shadcn/ui + Recharts + react-router-dom
+- **Frontend**: React (CRA) + TailwindCSS + shadcn/ui + Recharts + react-router-dom + next-themes (dark mode)
 - **Backend**: FastAPI + Motor (MongoDB async) + PyJWT + bcrypt + pypdf + python-docx + beautifulsoup4
 - **LLM**: GPT-5.2 via `emergentintegrations` library with Emergent Universal LLM Key
-- **Auth**: Custom JWT, httpOnly cookies only (no localStorage tokens)
-- **Streaming**: SSE for chat responses (clean per-token, no duplication)
+- **Auth**: Custom JWT, httpOnly cookies (no localStorage tokens) + Bearer fallback for API keys
+- **Streaming**: SSE for chat responses
+- **Theme**: next-themes (`.dark` class on `<html>`, persisted in `qiq-theme` localStorage key)
 
 ## What's Been Implemented
 
-### V1 (MVP) — shipped 2026-06-13
-- Landing page (hero, agents preview, pricing, social proof, footer)
-- Email/password auth (register, login, logout, /me) — JWT in httpOnly cookies
-- Dashboard with "My AI Workforce" cards and KPI tiles
-- AI chat with SSE streaming (GPT-5.2)
-- PDF knowledge base upload + indexing
-- Marketplace with 8 agent templates across 7 categories
-- Custom agent builder
-- Analytics page with KPIs + Recharts bar chart
-- Per-user seeded support agent on registration
-- Backend regression test suite (18 tests)
+### V6 (Operating-System tier) — shipped 2026-06-16
+- **Settings page** (6 tabs): Profile, Password (rejects wrong current_password), Theme (light/dark via next-themes), Notification preferences (8 toggles), Sessions (current device), Danger Zone (DELETE confirmation cascade-deletes account)
+- **Forgot/Reset password** flow: `POST /api/auth/forgot-password` (no email enumeration), `POST /api/auth/reset-password` (1-hour TTL token). Dev mode (`DEV_MODE=1`) returns the token inline for testing.
+- **6-step Onboarding wizard** (`/onboarding`): Company profile → Industry → Create agent → Upload knowledge → First chat → Complete. New registrations now auto-redirect to /onboarding (was: /dashboard). Skip button hits `/api/onboarding/skip`.
+- **AI Chief of Staff (Layer 34)** (`/chief`): Master coordinator agent auto-created on first visit. UI textarea → `POST /api/chief/route` → LLM identifies the right teammate → emits `[DELEGATE: ...]` → backend runs delegations and stitches a single executive-tone reply. Workforce summary (size, departments, conversations).
+- **AI Workforce overview** (`/workforce`): Full org view — stats + departments grouped by category + agent health leaderboard with progress bars.
+- **Industries page** (`/industries`): UI for the 5 prebuilt workforces (HVAC, Plumbing, Auto, Law, Real Estate). One-click install with idempotency + force-duplicate option.
+- **Department Builder** (`/departments`): Full CRUD with multi-agent picker, color swatches, descriptions. Backed by `db.departments`.
+- **Notifications system** + Bell dropdown: 6 types (`agent.task`, `conversation.new`, `team.invite`, `knowledge.upload`, `billing`, `system`). User can mark read/all-read/delete. Per-type opt-in/out via Settings → Notifications. Auto-fired on agent.create, team.invite, knowledge.upload, billing webhook.
+- **Global Search (Cmd+K)** (`<GlobalSearch>`): `/api/search?q=&types=` covers agents, conversations, knowledge (file names + KB text), team. 200ms debounce, arrow-key + Enter navigation, accessible (sr-only DialogTitle/DialogDescription).
+- **Activity Feed** (`/activity`): Unified audit + notifications timeline with filter chips (All / Notifications / Audit events).
+- **Help Center** (`/help`): 6 sections (Getting Started / Agents / Knowledge Base / Teams / Billing / FAQs) with expandable accordion items.
+- **Error pages**: `<NotFound>` (404), `<Forbidden>` (403), `<ServerError>` (500), `<Maintenance>` (503).
+- **Dark Mode** end-to-end: ThemeProvider via `next-themes`, theme-aware CSS variables (`.dark` overrides), theme-aware chat bubbles, sun/moon toggle in the top bar.
+- **Enhanced Dashboard**: 5 stat tiles (Cost Savings, Hours Saved, Active Agents, Tasks Completed, Performance) + Recent Conversations card + Agent Health card with progress bars + Quick-link tiles (Workforce / Industries / Activity / Help).
+- **AppShell rebuilt**: Reorganized sidebar with 3 sections (Main / Operations / Workspace), top bar with NotificationBell + ThemeToggle + Cmd+K search trigger, mobile drawer.
+- **Session management**: `GET /api/auth/sessions`, `DELETE /api/auth/sessions/{sid}` (logout-equivalent for current).
+- **Integrations registry**: `GET /api/integrations` lists OpenAI / Stripe / Resend / Twilio / ElevenLabs / Google SSO with `configured` booleans — surface for future plug-in.
+- **Agent performance metrics**: `GET /api/agents/{id}/metrics` (replies, msgs, health_score, hours_saved, cost_saved).
+- **Empty/Loading states**: Reusable `<EmptyState>` + `<LoadingState>` + `<SkeletonRow>` components.
+- **Responsive mobile**: hamburger drawer with full nav, mobile-friendly top bar.
+- **Bug fix**: PublicOnly mount-snapshot pattern fixes the Register → /dashboard race that previously prevented the onboarding wizard from showing.
+- **Code review fixes**: `is True/False` → `== True/False` everywhere; explicit pre-init for `text`, `title`, `session`, `status`, `ev` to silence Pyright "possibly unbound" warnings; sessionStorage usage in Embed.jsx documented as non-PII.
+- **Tests**: 91 backend tests pass (66 V1-V5 + 25 V6). 1 conditional skip for DEV_MODE-only path.
 
 ### V5 — shipped 2026-06-13
-- **Industry templates (Layer 33)**: 5 prebuilt workforces — HVAC, Plumbing, Auto Repair, Law Firm, Real Estate. One-click `POST /api/industries/{id}/install` creates 2-3 industry-tuned agents AND merges a starter Company Profile (without clobbering existing fields). Idempotent (returns 409 if already installed unless `?force=true`).
-- **Trial paywall (Layer 20 hardening)**: 14-day trial tracked via `trial_started_at`; `is_active(user)` gates agent creation + industry install (returns HTTP 402 when expired). `/api/billing/me` reports `trial_days_remaining` + `is_active`. Top-of-app `TrialBanner` shows during last 7 days, expired in destructive red.
-- **Team roles & invites (Layer 22)**: Each user owns an `organization` with `members[]`. Roles: owner, admin, manager, employee. `POST /api/team/invite` mints an invite_token; `GET /api/team` returns roster; `DELETE /api/team/{email}` removes (owners + admins only). Per-org RBAC enforced.
-- **Audit logs (Layer 22)**: `audit_log()` helper writes to `db.audit_logs` for every important action (agent.create, industry.install, team.invite/remove, api_key.create/revoke). `/audit` page renders the trail with filter.
-- **API keys (Layer 23)**: `/developer` page mints `qiq_<32-byte>` keys (raw shown ONCE). Authorization: `Bearer qiq_xxx` resolves via SHA256 lookup in `db.api_keys`. Per-key `last_used_at` tracking. Revoke = hard delete (irrecoverable). Session-only for create/revoke (cannot manage keys with a key).
-- Backend tests expanded to 66 (100% passing).
-- Sidebar reorganized into main + Workspace sections (Team / Billing / Audit / Developer).
+Industry templates (HVAC/Plumbing/Auto/Law/Real Estate), Trial paywall hardening, Team roles & invites, Audit logs, API keys, sidebar reorg.
 
 ### V4 — shipped 2026-06-13
-- **Conversations explorer**: `/conversations` page lists all threads (internal + embedded) with agent name, customer/visitor, last message preview, msg count, timestamp, EMBED badge for embed-sourced threads. Filters: by agent, by source (internal/embed). Client-side search. Per-row Export (JSON download) + Delete actions. Backend: `GET /api/conversations` (with agent_id/source filters, joins agent metadata, computes message_count via aggregate), `GET /api/conversations/{id}/export`, `DELETE /api/conversations/{id}`.
-- **Markdown rendering** in chat: assistant messages now render `react-markdown + remark-gfm` (tables, lists, code blocks, bold/italic, links, headings, blockquotes, hr). Active in both authenticated `/chat` and public `/embed/:token`. User messages stay plain text.
-- **Embed rate-limiting**: per-token (200/hour) and per-visitor (40/hour) sliding-window enforcement on `POST /api/embed/{token}/chat`. Backed by `embed_hits` collection with a TTL index (`expireAfterSeconds=3600`) for self-cleanup.
-- Backend tests expanded to 47 (100% passing).
+Conversations explorer, Markdown rendering, embed rate-limiting.
 
 ### V3 — shipped 2026-06-13
-- **Stripe Billing (Layer 20)**: `/billing` page with 3 tiers (Starter $99 / Pro $299 highlighted / Enterprise contact-sales). `/api/billing/checkout`, `/api/billing/status/{sid}`, `/api/billing/me`, `/api/webhook/stripe`. Uses Emergent's `sk_test_emergent` Stripe test key. `payment_transactions` collection logs every session; user.plan flips to paid tier on success.
-- **Multi-agent delegation (Layer 10 full)**: Team-aware system prompt instructs the LLM to emit `[DELEGATE: <agent> | <question>]` markers. Backend parses (max 2/turn), runs `_run_delegation` to call the target agent's chat with the same memory/team context, and stitches `— **Asked <agent>**: ...` blocks into the streamed reply. Works in both SSE `/chat` and JSON `/chat-sync`.
-- **Brute-force lockout (P0 hardening)**: 5 failed logins per email within 15-min window → HTTP 429. Uses `login_attempts` collection with TTL index for self-cleanup. Email-only identifier (ingress-IP agnostic).
-- **Website Embed Widget (Layer 25)**: `/api/agents/{id}/embed-enable|disable` mint a public token; public `/api/embed/{token}/agent` + `/api/embed/{token}/chat` endpoints (no auth). Customer-facing `/embed/:token` page is a self-contained chat UI. Drop-in `/widget.js` injects a floating button that opens the chat in an iframe — `<script src=".../widget.js" data-quotientiq-token="..." defer></script>`. Per-visitor conversation persistence.
-- Backend tests expanded to 42 (100% passing).
+Stripe billing (3 tiers), multi-agent delegation, brute-force lockout, website embed widget.
 
 ### V2 — shipped 2026-06-13
-- **Memory / Company Profile (Layer 9)**: `/profile` page; 7 structured fields (company_name, audience, products, services, pricing, brand_voice, policies); auto-injected into every agent's system prompt
-- **AI Org Chart (Layer 11)**: `/org` page with hierarchical tree; `parent_agent_id` on agents; reparent via dropdown; **cycle detection** on the server (multi-hop loops blocked)
-- **Team awareness (Layer 10 lite)**: every chat's system prompt now lists all sibling agents with their roles — agents can suggest the right teammate when out of scope
-- **Multi-format ingestion (Layer 7 expansion)**: PDF + DOCX + TXT + MD + CSV uploads; paste raw text; **URL crawl** (BeautifulSoup, runs in worker thread so it doesn't block the event loop)
-- 3-tab KnowledgePanel in chat (File / Paste / URL)
-- Sidebar nav extended with `Memory` + `Org Chart`
-- Test suite expanded to 31 tests (100% passing)
+Memory / Company Profile, AI Org Chart, multi-format ingestion (PDF/DOCX/TXT/URL).
 
-### Code Quality Fixes — shipped 2026-06-13
-- Removed JWT from localStorage entirely (httpOnly cookies only)
-- Refactored Chat.jsx (256 → ~120 lines) — extracted `useChatStream`, `useAgent` hooks; `KnowledgePanel`, `InstructionsPanel`, `MessageList`, `Composer`, `ChatHeader` components
-- Refactored `chat_with_agent` backend handler (73 → 18 lines) — extracted 7 helpers
-- ObjectId validation everywhere (400 instead of 500 on malformed IDs)
-- True partial PATCH on agents (`exclude_unset=True`)
-- Index-as-key bugs fixed in Landing + Chat
-- All `useEffect` mount-fetches use cancelled-guard pattern (no stale closures)
-- React `set-state-in-effect` lint-clean
+### V1 (MVP) — shipped 2026-06-13
+Landing page, auth, dashboard, AI chat (SSE streaming GPT-5.2), PDF KB upload, marketplace, builder, analytics.
 
 ## Test Credentials
 - Admin: `admin@quotientiq.com` / `admin123`
 
 ## Prioritized Backlog
 
-### P0 — Production hardening
-- Brute-force lockout on `/api/auth/login` (5-attempt rule from playbook)
-- Tighten CORS to `FRONTEND_URL` only for production
-- Bound per-field length on `CompanyProfileIn` (e.g. 5k chars/field) to cap token usage
+### P1 — Next up
+- **Vector embeddings + true semantic search** (Layer 7) — replace prompt-stuffed KB with vector DB-backed RAG
+- **Resend email integration** (`RESEND_API_KEY` required from user) — wire `forgot_password` to actually deliver
+- **Google SSO via Emergent Auth** (Layer 22)
+- **Conversation.new notification side-effect** — currently only chief/agent.create/team/upload/billing fire notifications
+- **Fire 'conversation.new' notification** on conversation insert (chat + embed)
 
-### P1 — V3 features
-- **Stripe billing**: 3 tiers ($99 / $299 / Custom), trial paywall, customer portal — requires Stripe test key (already in pod env per platform docs)
-- **Multi-agent collaboration (full)**: agent-to-agent delegation tool — when agent A determines a question belongs to agent B, A invokes B and returns a stitched answer
-- **Voice channel (Layer 18)**: Twilio inbound + ElevenLabs TTS — needs user-supplied Twilio + ElevenLabs keys
-- **Website embed widget (Layer 25)**: `<script>` snippet that drops the chat into any site
-- **Conversations explorer**: list/filter/export past conversations per agent
-- **Markdown / code-block rendering** in chat bubbles (currently plaintext)
-
-### P2 — Enterprise
-- SSO (Google / Microsoft / Okta) — Layer 22
-- Team roles (Owner / Admin / Manager / Employee)
-- Audit logs of every AI action
-- API keys + developer SDK + webhooks (Layers 23–24)
-- Industry templates (HVAC / plumbing / auto / law / real estate)
+### P2 — Polish
+- Modularize `server.py` (2230 lines → routers: auth/agents/billing/embed/chief/notifications/search/onboarding/departments)
+- PATCH support on `/api/departments/{id}` (allow partial updates)
+- Soft-delete API keys instead of hard delete (preserve audit trail)
+- More verticals: SaaS / E-commerce / Agencies / Healthcare / Finance industry templates
+- Annual billing pricing on `/billing`
+- Webhooks for developers (Layer 24)
 - i18n (English / French / Spanish / Arabic)
 
+### P3 — Blocked on user-provided keys
+- **Twilio + ElevenLabs voice channel** (Layer 18)
+- **Resend transactional emails** (welcome / invite / reset / weekly digest)
+
 ## Next Tasks (recommended)
-1. Add brute-force lockout to login
-2. Wire **Stripe** on the 3 pricing tiers (next iteration)
-3. Ship full multi-agent delegation (true Layer 10) — the differentiator
+1. Wire Resend when user provides `RESEND_API_KEY` (3 emails: welcome, invite, reset)
+2. Ship vector embeddings RAG (huge UX uplift)
+3. Modularize `server.py`
