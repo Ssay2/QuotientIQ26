@@ -21,7 +21,10 @@ export default function Embed() {
   ]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  // visitor_id is a non-sensitive random correlation id — safe in sessionStorage.
+  // visitor_id is a server-issued, non-PII random correlation token used solely
+  // to scope rate-limits + conversation continuity for unauthenticated embed visitors.
+  // It does NOT grant access to any user account or sensitive data, so sessionStorage
+  // is the appropriate scope (cleared on tab close).
   const visitorRef = useRef(sessionStorage.getItem(`qiq_visitor_${token}`) || null);
   const scrollRef = useRef(null);
 

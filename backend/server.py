@@ -341,6 +341,8 @@ async def create_agent(body: AgentIn, user: dict = Depends(get_current_user)):
     doc["id"] = str(res.inserted_id)
     doc.pop("_id", None)
     await audit_log(user["id"], "agent.create", "agent", doc["id"], {"name": doc["name"]})
+    await create_notification(user["id"], "agent.task", f"New agent created: {doc['name']}",
+                              body=doc.get("description", ""), link=f"/chat/{doc['id']}")
     return doc
 
 @api.get("/agents/{agent_id}")
@@ -430,6 +432,9 @@ async def _append_to_knowledge(agent_id: str, label: str, text: str, file_meta: 
         {"_id": oid},
         {"$set": {"knowledge_text": new_text[:300000], "knowledge_files": files}},
     )
+    await create_notification(a.get("user_id", ""), "knowledge.upload",
+                              f"Document uploaded to {a.get('name','agent')}",
+                              body=label[:160], link=f"/chat/{agent_id}")
     return {"ok": True, "filename": label, "chars": len(text), "files": files}
 
 @api.post("/agents/{agent_id}/upload")
@@ -440,6 +445,7 @@ async def upload_pdf(agent_id: str, file: UploadFile = File(...), user: dict = D
         raise HTTPException(404, "Agent not found")
     name = (file.filename or "").lower()
     content = await file.read()
+    text: str = ""
     try:
         if name.endswith(".pdf"):
             text = _extract_pdf(content)
@@ -481,6 +487,8 @@ async def ingest_url(agent_id: str, body: UrlIngestIn, user: dict = Depends(get_
     a = await db.agents.find_one({"_id": to_object_id(agent_id, "agent id"), "user_id": user["id"]})
     if not a:
         raise HTTPException(404, "Agent not found")
+    title: str = ""
+    text: str = ""
     try:
         title, text = await _extract_url(body.url)
     except Exception as e:
@@ -727,14 +735,67 @@ async def chat_sync(agent_id: str, body: ChatMessageIn, user: dict = Depends(get
 # ---------------- Analytics ----------------
 @api.get("/analytics/summary")
 async def analytics_summary(user: dict = Depends(get_current_user)):
-    agents_count = await db.agents.count_documents({"user_id": user["id"]})
+    agents = await db.agents.find({"user_id": user["id"]}, {"name": 1, "icon": 1, "category": 1, "status": 1}).to_list(500)
+    agents_count = len(agents)
+    active_agents = sum(1 for a in agents if a.get("status", "active") == "active")
     convs = await db.conversations.find({"user_id": user["id"]}).to_list(5000)
     total_msgs = sum(len(c.get("messages", [])) for c in convs)
     ai_replies = sum(1 for c in convs for m in c.get("messages", []) if m.get("role") == "assistant")
     hours_saved = round(ai_replies * 0.15, 1)  # 9 minutes per AI reply saved
     cost_saved = round(ai_replies * 4.5, 2)    # $4.50 per resolved issue saved
     perf = 92 if ai_replies > 0 else 0
-    # Last 7 days breakdown
+
+    # Per-agent health and recent conversations
+    by_agent: dict = {}
+    for c in convs:
+        aid = c.get("agent_id")
+        if not aid:
+            continue
+        by_agent.setdefault(aid, {"msgs": 0, "replies": 0, "last": ""})
+        for m in c.get("messages", []):
+            by_agent[aid]["msgs"] += 1
+            if m.get("role") == "assistant":
+                by_agent[aid]["replies"] += 1
+        by_agent[aid]["last"] = max(by_agent[aid]["last"], c.get("updated_at", ""))
+
+    agent_health = []
+    for a in agents:
+        aid = str(a["_id"])
+        stats = by_agent.get(aid, {"msgs": 0, "replies": 0, "last": ""})
+        replies = stats["replies"]
+        health = 60
+        if replies > 0:
+            health = min(99, 60 + min(35, replies))
+        agent_health.append({
+            "id": aid,
+            "name": a.get("name"),
+            "icon": a.get("icon", "Sparkles"),
+            "category": a.get("category"),
+            "messages": stats["msgs"],
+            "replies": replies,
+            "last_active": stats["last"],
+            "health": health,
+        })
+    agent_health.sort(key=lambda x: x["replies"], reverse=True)
+
+    # Recent conversations preview
+    recent = sorted(convs, key=lambda c: c.get("updated_at", ""), reverse=True)[:5]
+    amap = {str(a["_id"]): a.get("name") for a in agents}
+    recent_out = []
+    for c in recent:
+        msgs = c.get("messages") or []
+        last = msgs[-1] if msgs else {}
+        recent_out.append({
+            "id": str(c["_id"]),
+            "agent_id": c.get("agent_id"),
+            "agent_name": amap.get(c.get("agent_id"), "Agent"),
+            "customer": c.get("customer_name", "Guest"),
+            "preview": (last.get("content") or "")[:120],
+            "updated_at": c.get("updated_at"),
+            "msg_count": len(msgs),
+        })
+
+    # Last 14 days
     from collections import defaultdict
     daily = defaultdict(int)
     for c in convs:
@@ -745,6 +806,7 @@ async def analytics_summary(user: dict = Depends(get_current_user)):
     series = sorted([{"date": d, "count": n} for d, n in daily.items()], key=lambda x: x["date"])[-14:]
     return {
         "agents": agents_count,
+        "active_agents": active_agents,
         "conversations": len(convs),
         "messages": total_msgs,
         "tasks_completed": ai_replies,
@@ -752,6 +814,8 @@ async def analytics_summary(user: dict = Depends(get_current_user)):
         "cost_saved": cost_saved,
         "performance_score": perf,
         "series": series,
+        "agent_health": agent_health[:6],
+        "recent_conversations": recent_out,
     }
 
 # ---------------- Marketplace (static catalog) ----------------
@@ -876,6 +940,9 @@ async def billing_checkout(body: CheckoutIn, user: dict = Depends(get_current_us
     except Exception as e:
         raise HTTPException(502, f"Stripe error: {e}")
 
+    if not session or not session.session_id:
+        raise HTTPException(502, "Stripe did not return a session id")
+
     await db.payment_transactions.insert_one({
         "session_id": session.session_id,
         "user_id": user["id"],
@@ -911,6 +978,9 @@ async def billing_status(session_id: str, request: Request, user: dict = Depends
         status: CheckoutStatusResponse = await stripe.get_checkout_status(session_id)
     except Exception as e:
         raise HTTPException(502, f"Stripe error: {e}")
+
+    if not status:
+        raise HTTPException(502, "Stripe did not return a status")
 
     update = {
         "status": status.status,
@@ -952,6 +1022,9 @@ async def stripe_webhook(request: Request):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+    if not ev:
+        return {"ok": False, "error": "empty webhook payload"}
+
     txn = await db.payment_transactions.find_one({"session_id": ev.session_id}) if ev.session_id else None
     if not txn:
         return {"ok": True, "event": ev.event_type}
@@ -964,6 +1037,8 @@ async def stripe_webhook(request: Request):
             {"_id": to_object_id(txn["user_id"], "user id")},
             {"$set": {"plan": txn["plan_id"], "plan_activated_at": now_iso()}},
         )
+        await create_notification(txn["user_id"], "billing", "Subscription activated",
+                                  body=f"Plan: {txn['plan_id']}", link="/billing")
     return {"ok": True, "event": ev.event_type}
 
 # ---------------- Multi-Agent Delegation ----------------
@@ -1360,6 +1435,8 @@ async def invite_member(body: InviteIn, user: dict = Depends(get_current_user)):
         {"$push": {"members": new_member}},
     )
     await audit_log(user["id"], "team.invite", "user", email, {"role": body.role})
+    await create_notification(user["id"], "team.invite", f"Invited {email}",
+                              body=f"Role: {body.role}", link="/team")
     return {"ok": True, "email": email, "role": body.role, "invite_token": invite_token}
 
 @api.delete("/team/{email}")
@@ -1445,6 +1522,604 @@ async def revoke_api_key(key_id: str, user: dict = Depends(get_current_user)):
     await audit_log(user["id"], "api_key.revoke", "api_key", key_id)
     return {"ok": True}
 
+# ---------------- Settings (Profile / Password / Account / Preferences) ----------------
+class ProfileUpdateIn(BaseModel):
+    name: Optional[str] = None
+    company: Optional[str] = None
+
+class PasswordChangeIn(BaseModel):
+    current_password: str
+    new_password: str
+
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    new_password: str
+
+class NotificationPrefsIn(BaseModel):
+    agent_tasks: Optional[bool] = None
+    new_conversations: Optional[bool] = None
+    team_invites: Optional[bool] = None
+    knowledge_uploads: Optional[bool] = None
+    billing_alerts: Optional[bool] = None
+    weekly_digest: Optional[bool] = None
+    email_enabled: Optional[bool] = None
+    push_enabled: Optional[bool] = None
+
+DEFAULT_NOTIF_PREFS = {
+    "agent_tasks": True,
+    "new_conversations": True,
+    "team_invites": True,
+    "knowledge_uploads": True,
+    "billing_alerts": True,
+    "weekly_digest": True,
+    "email_enabled": False,  # disabled until Resend wired
+    "push_enabled": True,
+}
+
+@api.put("/auth/profile")
+async def update_profile(body: ProfileUpdateIn, user: dict = Depends(get_current_user)):
+    updates = {k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None}
+    if not updates:
+        return user
+    updates["updated_at"] = now_iso()
+    await db.users.update_one({"_id": to_object_id(user["id"], "user id")}, {"$set": updates})
+    await audit_log(user["id"], "profile.update", "user", user["id"], updates)
+    return {**user, **updates}
+
+@api.put("/auth/password")
+async def change_password(body: PasswordChangeIn, user: dict = Depends(get_current_user)):
+    doc = await db.users.find_one({"_id": to_object_id(user["id"], "user id")})
+    if not doc or not verify_password(body.current_password, doc["password_hash"]):
+        raise HTTPException(400, "Current password is incorrect")
+    if len(body.new_password) < 8:
+        raise HTTPException(400, "New password must be at least 8 characters")
+    await db.users.update_one(
+        {"_id": to_object_id(user["id"], "user id")},
+        {"$set": {"password_hash": hash_password(body.new_password), "password_changed_at": now_iso()}},
+    )
+    await audit_log(user["id"], "password.change", "user", user["id"])
+    return {"ok": True}
+
+@api.delete("/auth/account")
+async def delete_account(response: Response, user: dict = Depends(get_current_user)):
+    if user.get("auth_via") == "api_key":
+        raise HTTPException(403, "Cannot delete account with an API key")
+    uid = user["id"]
+    # Cascade delete owned data
+    await db.agents.delete_many({"user_id": uid})
+    await db.conversations.delete_many({"user_id": uid})
+    await db.company_profiles.delete_many({"user_id": uid})
+    await db.audit_logs.delete_many({"user_id": uid})
+    await db.api_keys.delete_many({"user_id": uid})
+    await db.notifications.delete_many({"user_id": uid})
+    await db.user_settings.delete_many({"user_id": uid})
+    await db.payment_transactions.delete_many({"user_id": uid})
+    if user.get("org_id"):
+        await db.organizations.delete_one({"_id": to_object_id(user["org_id"], "org id"), "owner_id": uid})
+    await db.users.delete_one({"_id": to_object_id(uid, "user id")})
+    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("refresh_token", path="/")
+    return {"ok": True}
+
+@api.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordIn):
+    # Always respond 200 to avoid email enumeration. Tokens stored regardless of email send.
+    email = body.email.lower()
+    user = await db.users.find_one({"email": email})
+    if user:
+        token = secrets.token_urlsafe(32)
+        await db.password_resets.insert_one({
+            "user_id": str(user["_id"]),
+            "email": email,
+            "token": token,
+            "created_at": now_iso(),
+            "ts_dt": datetime.now(timezone.utc),
+            "used": False,
+        })
+        # NOTE: When Resend is configured, send email here. For now token is returned in dev mode only.
+        if os.environ.get("DEV_MODE") == "1":
+            return {"ok": True, "dev_token": token}
+        logger.info(f"[Password reset] token issued for {email} (Resend not configured)")
+    return {"ok": True, "message": "If the account exists, a reset link has been sent."}
+
+@api.post("/auth/reset-password")
+async def reset_password(body: ResetPasswordIn):
+    if len(body.new_password) < 8:
+        raise HTTPException(400, "New password must be at least 8 characters")
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    doc = await db.password_resets.find_one({"token": body.token, "used": False, "created_at": {"$gte": cutoff}})
+    if not doc:
+        raise HTTPException(400, "Invalid or expired reset token")
+    await db.users.update_one(
+        {"_id": to_object_id(doc["user_id"], "user id")},
+        {"$set": {"password_hash": hash_password(body.new_password), "password_changed_at": now_iso()}},
+    )
+    await db.password_resets.update_one({"_id": doc["_id"]}, {"$set": {"used": True, "used_at": now_iso()}})
+    return {"ok": True}
+
+@api.get("/settings/notifications")
+async def get_notification_prefs(user: dict = Depends(get_current_user)):
+    doc = await db.user_settings.find_one({"user_id": user["id"]}) or {}
+    prefs = {**DEFAULT_NOTIF_PREFS, **(doc.get("notifications") or {})}
+    return prefs
+
+@api.put("/settings/notifications")
+async def set_notification_prefs(body: NotificationPrefsIn, user: dict = Depends(get_current_user)):
+    incoming = {k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None}
+    doc = await db.user_settings.find_one({"user_id": user["id"]}) or {}
+    merged = {**DEFAULT_NOTIF_PREFS, **(doc.get("notifications") or {}), **incoming}
+    await db.user_settings.update_one(
+        {"user_id": user["id"]},
+        {"$set": {"notifications": merged, "updated_at": now_iso()}, "$setOnInsert": {"created_at": now_iso()}},
+        upsert=True,
+    )
+    return merged
+
+# ---------------- Notifications ----------------
+NOTIF_TYPES = ("agent.task", "conversation.new", "team.invite", "knowledge.upload", "billing", "system")
+
+async def create_notification(user_id: str, type: str, title: str, body: str = "", link: str = "", metadata: Optional[dict] = None) -> None:
+    """Insert a notification. Never raise; notifications must not break primary flows."""
+    try:
+        prefs_doc = await db.user_settings.find_one({"user_id": user_id}) or {}
+        prefs = {**DEFAULT_NOTIF_PREFS, **(prefs_doc.get("notifications") or {})}
+        type_prefs_map = {
+            "agent.task": prefs.get("agent_tasks", True),
+            "conversation.new": prefs.get("new_conversations", True),
+            "team.invite": prefs.get("team_invites", True),
+            "knowledge.upload": prefs.get("knowledge_uploads", True),
+            "billing": prefs.get("billing_alerts", True),
+        }
+        if not type_prefs_map.get(type, True):
+            return
+        await db.notifications.insert_one({
+            "user_id": user_id,
+            "type": type,
+            "title": title,
+            "body": body,
+            "link": link,
+            "metadata": metadata or {},
+            "read": False,
+            "ts": now_iso(),
+            "ts_dt": datetime.now(timezone.utc),
+        })
+    except Exception:
+        pass
+
+@api.get("/notifications")
+async def list_notifications(unread_only: bool = False, limit: int = 50, user: dict = Depends(get_current_user)):
+    query: dict = {"user_id": user["id"]}
+    if unread_only:
+        query["read"] = False
+    cursor = db.notifications.find(query).sort("ts", -1).limit(limit)
+    out = []
+    async for n in cursor:
+        n["id"] = str(n.pop("_id"))
+        n.pop("ts_dt", None)
+        out.append(n)
+    unread = await db.notifications.count_documents({"user_id": user["id"], "read": False})
+    return {"notifications": out, "unread": unread}
+
+@api.put("/notifications/{nid}/read")
+async def mark_notif_read(nid: str, user: dict = Depends(get_current_user)):
+    result = await db.notifications.update_one(
+        {"_id": to_object_id(nid, "notification id"), "user_id": user["id"]},
+        {"$set": {"read": True, "read_at": now_iso()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Notification not found")
+    return {"ok": True}
+
+@api.put("/notifications/read-all")
+async def mark_all_notifs_read(user: dict = Depends(get_current_user)):
+    res = await db.notifications.update_many(
+        {"user_id": user["id"], "read": False},
+        {"$set": {"read": True, "read_at": now_iso()}},
+    )
+    return {"ok": True, "marked": res.modified_count}
+
+@api.delete("/notifications/{nid}")
+async def delete_notif(nid: str, user: dict = Depends(get_current_user)):
+    result = await db.notifications.delete_one({"_id": to_object_id(nid, "notification id"), "user_id": user["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Notification not found")
+    return {"ok": True}
+
+# ---------------- Global Search (Cmd+K) ----------------
+@api.get("/search")
+async def global_search(q: str = "", types: str = "agents,conversations,knowledge,team", limit: int = 20, user: dict = Depends(get_current_user)):
+    q = (q or "").strip()
+    if not q:
+        return {"results": [], "count": 0, "query": q}
+    selected = set([t.strip() for t in types.split(",") if t.strip()])
+    import re as _re
+    safe = _re.escape(q)
+    pat = {"$regex": safe, "$options": "i"}
+    results: list[dict] = []
+
+    if "agents" in selected:
+        cursor = db.agents.find(
+            {"user_id": user["id"], "$or": [{"name": pat}, {"role": pat}, {"description": pat}, {"category": pat}]},
+            {"name": 1, "category": 1, "icon": 1, "description": 1},
+        ).limit(limit)
+        async for a in cursor:
+            results.append({
+                "type": "agent",
+                "id": str(a["_id"]),
+                "title": a.get("name", ""),
+                "subtitle": a.get("category", ""),
+                "icon": a.get("icon", "Sparkles"),
+                "link": f"/chat/{a['_id']}",
+                "snippet": (a.get("description") or "")[:120],
+            })
+
+    if "conversations" in selected:
+        cursor = db.conversations.find(
+            {"user_id": user["id"], "$or": [{"customer_name": pat}, {"messages.content": pat}]},
+            {"agent_id": 1, "customer_name": 1, "updated_at": 1, "messages": {"$slice": -1}},
+        ).sort("updated_at", -1).limit(limit)
+        async for c in cursor:
+            last = (c.get("messages") or [{}])[-1]
+            results.append({
+                "type": "conversation",
+                "id": str(c["_id"]),
+                "title": c.get("customer_name") or "Conversation",
+                "subtitle": (c.get("updated_at") or "")[:10],
+                "icon": "MessageSquare",
+                "link": "/conversations",
+                "snippet": (last.get("content") or "")[:140],
+            })
+
+    if "knowledge" in selected:
+        # search across knowledge_files names AND knowledge_text snippets
+        cursor = db.agents.find(
+            {"user_id": user["id"], "$or": [{"knowledge_files.name": pat}, {"knowledge_text": pat}]},
+            {"name": 1, "knowledge_files": 1, "knowledge_text": 1},
+        ).limit(limit)
+        async for a in cursor:
+            # File matches
+            for f in (a.get("knowledge_files") or []):
+                if q.lower() in (f.get("name") or "").lower():
+                    results.append({
+                        "type": "knowledge",
+                        "id": f"{a['_id']}::{f.get('name')}",
+                        "title": f.get("name") or "Document",
+                        "subtitle": f"{a.get('name')} • {f.get('kind','file')}",
+                        "icon": "FileText",
+                        "link": f"/chat/{a['_id']}",
+                        "snippet": f"Uploaded {(f.get('uploaded_at') or '')[:10]}",
+                    })
+            # Text snippet match
+            txt = a.get("knowledge_text") or ""
+            if q.lower() in txt.lower():
+                idx = txt.lower().find(q.lower())
+                snippet = txt[max(0, idx - 40): idx + 120]
+                results.append({
+                    "type": "knowledge",
+                    "id": f"{a['_id']}::text",
+                    "title": f"{a.get('name')} knowledge",
+                    "subtitle": "from KB text",
+                    "icon": "BookOpen",
+                    "link": f"/chat/{a['_id']}",
+                    "snippet": "…" + snippet + "…",
+                })
+
+    if "team" in selected and user.get("org_id"):
+        org = await db.organizations.find_one({"_id": to_object_id(user["org_id"], "org id")})
+        for m in (org.get("members") or []) if org else []:
+            if q.lower() in (m.get("email") or "").lower() or q.lower() in (m.get("role") or "").lower():
+                results.append({
+                    "type": "team",
+                    "id": m.get("email"),
+                    "title": m.get("email"),
+                    "subtitle": m.get("role"),
+                    "icon": "Users",
+                    "link": "/team",
+                    "snippet": "Team member",
+                })
+
+    return {"results": results[:limit * 3], "count": len(results), "query": q}
+
+# ---------------- Onboarding ----------------
+class OnboardingStepIn(BaseModel):
+    step: int
+    completed: bool = False
+    data: Optional[dict] = None
+
+@api.get("/onboarding/status")
+async def onboarding_status(user: dict = Depends(get_current_user)):
+    s = await db.onboarding.find_one({"user_id": user["id"]}) or {}
+    profile = await db.company_profiles.find_one({"user_id": user["id"]}) or {}
+    agent_count = await db.agents.count_documents({"user_id": user["id"]})
+    files = await db.agents.find({"user_id": user["id"], "knowledge_files.0": {"$exists": True}}).to_list(1)
+    has_files = len(files) > 0
+    has_convo = await db.conversations.count_documents({"user_id": user["id"]}) > 0
+    return {
+        "current_step": s.get("current_step", 1),
+        "completed": bool(s.get("completed")),
+        "completed_at": s.get("completed_at"),
+        "skipped": bool(s.get("skipped")),
+        "checks": {
+            "company_profile": bool(profile.get("company_name") or profile.get("services")),
+            "industry_installed": bool(s.get("industry_installed")),
+            "first_agent": agent_count > 0,
+            "first_upload": has_files,
+            "first_conversation": has_convo,
+        },
+    }
+
+@api.put("/onboarding/step")
+async def onboarding_update(body: OnboardingStepIn, user: dict = Depends(get_current_user)):
+    update = {"current_step": body.step, "updated_at": now_iso()}
+    if body.completed:
+        update["completed"] = True
+        update["completed_at"] = now_iso()
+    if body.data and isinstance(body.data, dict):
+        for k, v in body.data.items():
+            if k in ("industry_installed", "company_set", "agent_created", "file_uploaded", "chat_started"):
+                update[k] = v
+    await db.onboarding.update_one(
+        {"user_id": user["id"]},
+        {"$set": update, "$setOnInsert": {"user_id": user["id"], "created_at": now_iso()}},
+        upsert=True,
+    )
+    return {"ok": True, **update}
+
+@api.post("/onboarding/skip")
+async def onboarding_skip(user: dict = Depends(get_current_user)):
+    await db.onboarding.update_one(
+        {"user_id": user["id"]},
+        {"$set": {"skipped": True, "completed": True, "completed_at": now_iso()}, "$setOnInsert": {"user_id": user["id"], "created_at": now_iso()}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+# ---------------- AI Chief of Staff (Layer 34) ----------------
+CHIEF_NAME = "AI Chief of Staff"
+CHIEF_INSTRUCTIONS = (
+    "You are the AI Chief of Staff for this organization. Your job is to:\n"
+    "1. ROUTE incoming tasks to the right department/specialist agent\n"
+    "2. DELEGATE work to the most-qualified teammate\n"
+    "3. COORDINATE multi-step work across departments\n"
+    "4. ESCALATE urgent or out-of-scope issues to the human owner\n"
+    "5. MONITOR workforce health and surface bottlenecks\n\n"
+    "When a user gives you a task: first identify WHICH teammate (by name) is best suited, "
+    "then emit a [DELEGATE: <Teammate name> | <The specific task>] tag at the end of your reply. "
+    "You may delegate to up to 2 teammates per task. Synthesize their answers into a single clear plan for the user.\n"
+    "If no teammate fits, ask the user to hire one from /marketplace. Always speak in a calm, executive tone."
+)
+
+async def ensure_chief_of_staff(user_id: str) -> dict:
+    chief = await db.agents.find_one({"user_id": user_id, "is_chief": True})
+    if chief:
+        chief["id"] = str(chief.pop("_id"))
+        return chief
+    doc = {
+        "user_id": user_id,
+        "name": CHIEF_NAME,
+        "role": "Executive Coordinator",
+        "category": "Leadership",
+        "icon": "Crown",
+        "description": "Master coordinator. Routes tasks, delegates work, coordinates departments, escalates issues.",
+        "instructions": CHIEF_INSTRUCTIONS,
+        "status": "active",
+        "is_chief": True,
+        "knowledge_text": "",
+        "knowledge_files": [],
+        "created_at": now_iso(),
+    }
+    res = await db.agents.insert_one(doc)
+    doc["id"] = str(res.inserted_id)
+    return doc
+
+@api.get("/chief")
+async def get_chief(user: dict = Depends(get_current_user)):
+    chief = await ensure_chief_of_staff(user["id"])
+    chief.pop("knowledge_text", None)
+    # Workforce summary
+    agents = await db.agents.find({"user_id": user["id"]}).to_list(500)
+    by_category: dict = {}
+    for a in agents:
+        cat = a.get("category") or "Other"
+        by_category.setdefault(cat, []).append({"id": str(a["_id"]), "name": a.get("name"), "icon": a.get("icon")})
+    convs = await db.conversations.count_documents({"user_id": user["id"]})
+    return {
+        "chief": chief,
+        "workforce_size": len(agents),
+        "departments": by_category,
+        "conversations": convs,
+    }
+
+class ChiefTaskIn(BaseModel):
+    task: str
+
+@api.post("/chief/route")
+async def chief_route(body: ChiefTaskIn, user: dict = Depends(get_current_user)):
+    """Send a task to the Chief of Staff and let them route/delegate it."""
+    chief = await ensure_chief_of_staff(user["id"])
+    chief_doc = await db.agents.find_one({"_id": to_object_id(chief["id"], "agent id")})
+    if not chief_doc:
+        raise HTTPException(500, "Chief of Staff not initialized")
+    conv = await db.conversations.find_one({"agent_id": chief["id"], "user_id": user["id"], "tag": "chief"})
+    if not conv:
+        res = await db.conversations.insert_one({
+            "agent_id": chief["id"], "user_id": user["id"], "customer_name": user.get("name", "Owner"),
+            "tag": "chief", "messages": [], "created_at": now_iso(), "updated_at": now_iso(),
+        })
+        conv_id = str(res.inserted_id)
+    else:
+        conv_id = str(conv["_id"])
+
+    chat = _make_llm_chat(conv_id, await _build_system_message_full(chief_doc))
+    full = ""
+    async for ev in chat.stream_message(UserMessage(text=body.task)):
+        if isinstance(ev, TextDelta):
+            full += ev.content
+        elif isinstance(ev, StreamDone):
+            break
+
+    cleaned, delegations = _parse_delegations(full)
+    final_text = cleaned or full
+    delegation_results = []
+    for d in delegations[:2]:
+        result = await _run_delegation(user["id"], chief["id"], d["agent"], d["question"])
+        delegation_results.append(result)
+        if result.get("ok"):
+            final_text += f"\n\n— **Delegated to {result['agent']}**: {d['question']}\n{result['reply']}"
+        else:
+            final_text += f"\n\n_({result.get('error', 'Delegation failed')})_"
+
+    now = now_iso()
+    await db.conversations.update_one(
+        {"_id": to_object_id(conv_id, "conversation id")},
+        {"$push": {"messages": {"$each": [
+            {"role": "user", "content": body.task, "timestamp": now},
+            {"role": "assistant", "content": final_text, "timestamp": now},
+        ]}}, "$set": {"updated_at": now}},
+    )
+    await create_notification(user["id"], "agent.task", "Chief of Staff completed routing",
+                              body=body.task[:120], link="/chief")
+    return {"reply": final_text, "delegations": delegation_results, "conversation_id": conv_id}
+
+# ---------------- Departments ----------------
+class DepartmentIn(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    agent_ids: Optional[List[str]] = []
+    color: Optional[str] = "#0A0A0A"
+
+@api.get("/departments")
+async def list_departments(user: dict = Depends(get_current_user)):
+    cursor = db.departments.find({"user_id": user["id"]}).sort("created_at", 1)
+    out = []
+    async for d in cursor:
+        d["id"] = str(d.pop("_id"))
+        out.append(d)
+    return {"departments": out}
+
+@api.post("/departments")
+async def create_department(body: DepartmentIn, user: dict = Depends(get_current_user)):
+    doc = body.model_dump()
+    doc.update({"user_id": user["id"], "created_at": now_iso()})
+    res = await db.departments.insert_one(doc)
+    doc["id"] = str(res.inserted_id)
+    doc.pop("_id", None)
+    return doc
+
+@api.put("/departments/{dept_id}")
+async def update_department(dept_id: str, body: DepartmentIn, user: dict = Depends(get_current_user)):
+    await db.departments.update_one(
+        {"_id": to_object_id(dept_id, "department id"), "user_id": user["id"]},
+        {"$set": {**body.model_dump(), "updated_at": now_iso()}},
+    )
+    return {"ok": True}
+
+@api.delete("/departments/{dept_id}")
+async def delete_department(dept_id: str, user: dict = Depends(get_current_user)):
+    res = await db.departments.delete_one({"_id": to_object_id(dept_id, "department id"), "user_id": user["id"]})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Department not found")
+    return {"ok": True}
+
+# ---------------- Agent Performance Metrics ----------------
+@api.get("/agents/{agent_id}/metrics")
+async def agent_metrics(agent_id: str, user: dict = Depends(get_current_user)):
+    await _load_agent_or_404(agent_id, user["id"])
+    convs = await db.conversations.find({"agent_id": agent_id, "user_id": user["id"]}).to_list(2000)
+    total_msgs = sum(len(c.get("messages", [])) for c in convs)
+    ai_replies = sum(1 for c in convs for m in c.get("messages", []) if m.get("role") == "assistant")
+    avg_msgs_per_convo = (total_msgs / max(len(convs), 1)) if convs else 0
+    # Health: based on volume + recency
+    last_ts = max((c.get("updated_at", "") for c in convs), default="")
+    health = 60
+    if ai_replies > 0:
+        health = min(99, 60 + min(35, ai_replies))
+    health -= (0 if convs else 20)
+    return {
+        "agent_id": agent_id,
+        "conversations": len(convs),
+        "messages": total_msgs,
+        "ai_replies": ai_replies,
+        "avg_msgs_per_convo": round(avg_msgs_per_convo, 1),
+        "last_active": last_ts,
+        "health_score": max(0, health),
+        "hours_saved": round(ai_replies * 0.15, 1),
+        "cost_saved": round(ai_replies * 4.5, 2),
+    }
+
+# ---------------- Activity Feed ----------------
+@api.get("/activity")
+async def activity_feed(limit: int = 50, user: dict = Depends(get_current_user)):
+    """Unified feed of audit logs + notifications + recent conversations."""
+    logs = await db.audit_logs.find({"user_id": user["id"]}).sort("ts", -1).limit(limit).to_list(limit)
+    notifs = await db.notifications.find({"user_id": user["id"]}).sort("ts", -1).limit(limit).to_list(limit)
+    items = []
+    for log in logs:
+        items.append({
+            "id": str(log["_id"]),
+            "kind": "audit",
+            "action": log.get("action"),
+            "title": log.get("action"),
+            "metadata": log.get("metadata"),
+            "ts": log.get("ts"),
+        })
+    for n in notifs:
+        items.append({
+            "id": str(n["_id"]),
+            "kind": "notification",
+            "type": n.get("type"),
+            "title": n.get("title"),
+            "body": n.get("body"),
+            "link": n.get("link"),
+            "ts": n.get("ts"),
+        })
+    items.sort(key=lambda x: x.get("ts", ""), reverse=True)
+    return {"items": items[:limit], "count": len(items[:limit])}
+
+# ---------------- Integrations registry (stubs ready to plug in) ----------------
+@api.get("/integrations")
+async def list_integrations(user: dict = Depends(get_current_user)):
+    """Show which integrations are configured. Keys are read from env."""
+    return {
+        "integrations": [
+            {"id": "openai", "name": "OpenAI GPT-5.2", "category": "LLM", "configured": bool(os.environ.get("EMERGENT_LLM_KEY")), "required_env": ["EMERGENT_LLM_KEY"]},
+            {"id": "stripe", "name": "Stripe Billing", "category": "Payments", "configured": bool(STRIPE_API_KEY), "required_env": ["STRIPE_API_KEY"]},
+            {"id": "resend", "name": "Resend Email", "category": "Email", "configured": bool(os.environ.get("RESEND_API_KEY")), "required_env": ["RESEND_API_KEY"]},
+            {"id": "twilio", "name": "Twilio Voice", "category": "Voice", "configured": bool(os.environ.get("TWILIO_AUTH_TOKEN")), "required_env": ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_NUMBER"]},
+            {"id": "elevenlabs", "name": "ElevenLabs TTS", "category": "Voice", "configured": bool(os.environ.get("ELEVENLABS_API_KEY")), "required_env": ["ELEVENLABS_API_KEY"]},
+            {"id": "google_sso", "name": "Google SSO", "category": "Auth", "configured": False, "required_env": []},
+        ]
+    }
+
+# ---------------- Sessions (active devices) ----------------
+@api.get("/auth/sessions")
+async def list_sessions(request: Request, user: dict = Depends(get_current_user)):
+    # We don't persist sessions yet — derive a single 'current session' from the JWT cookie.
+    # When SSO / refresh-token rotation is wired in, this will be replaced with a real list.
+    token = request.cookies.get("access_token")
+    return {
+        "sessions": [
+            {
+                "id": "current",
+                "current": True,
+                "user_agent": request.headers.get("user-agent", "unknown"),
+                "ip": request.client.host if request.client else None,
+                "issued_at": user.get("last_login") or now_iso(),
+                "expires_at": (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat() if token else None,
+            }
+        ]
+    }
+
+@api.delete("/auth/sessions/{sid}")
+async def revoke_session(sid: str, response: Response, user: dict = Depends(get_current_user)):
+    # Revoking the current session = logout.
+    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("refresh_token", path="/")
+    return {"ok": True}
+
 @api.get("/")
 async def root():
     return {"service": "QuotientIQ API", "status": "ok"}
@@ -1488,6 +2163,16 @@ async def startup():
     await db.api_keys.create_index("key_sha256", unique=True)
     await db.api_keys.create_index("user_id")
     await db.organizations.create_index("owner_id")
+    await db.notifications.create_index([("user_id", 1), ("ts", -1)])
+    await db.notifications.create_index([("user_id", 1), ("read", 1)])
+    await db.password_resets.create_index("token")
+    try:
+        await db.password_resets.create_index("ts_dt", expireAfterSeconds=3600)
+    except Exception:
+        pass
+    await db.onboarding.create_index("user_id", unique=True)
+    await db.departments.create_index("user_id")
+    await db.user_settings.create_index("user_id", unique=True)
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@quotientiq.com").lower()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")

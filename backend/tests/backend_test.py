@@ -93,7 +93,7 @@ class TestAuth:
     def test_logout(self, admin_client):
         r = admin_client.post(f"{API}/auth/logout")
         assert r.status_code == 200
-        assert r.json().get("ok") is True
+        assert r.json().get("ok") == True
 
 
 # -------- Seeded agent on register --------
@@ -208,7 +208,7 @@ class TestPDFUpload:
         r = fresh_user_client.post(f"{API}/agents/{agent_id}/upload", files=files)
         assert r.status_code == 200, r.text
         d = r.json()
-        assert d["ok"] is True
+        assert d["ok"] == True
         assert d["filename"] == "policy.pdf"
         assert d["chars"] > 0
         # Verify agent has file
@@ -317,7 +317,7 @@ class TestIngestText:
         )
         assert r.status_code == 200, r.text
         d = r.json()
-        assert d["ok"] is True
+        assert d["ok"] == True
         assert d["chars"] > 0
 
     def test_ingest_empty_text_rejected(self, fresh_user_client):
@@ -372,7 +372,7 @@ class TestMultiFormatUpload:
         )
         assert r.status_code == 200, r.text
         d = r.json()
-        assert d["ok"] is True
+        assert d["ok"] == True
         assert d["chars"] > 0
 
     def test_upload_txt(self, fresh_user_client):
@@ -933,7 +933,7 @@ class TestIndustries:
         r = fresh_user_client.post(f"{API}/industries/hvac/install")
         assert r.status_code == 200, r.text
         d = r.json()
-        assert d["ok"] is True
+        assert d["ok"] == True
         assert d["industry_id"] == "hvac"
         assert d["agents_created"] >= 1
         assert len(d["agent_ids"]) == d["agents_created"]
@@ -967,7 +967,7 @@ class TestTrial:
         assert d["plan"] == "free"
         assert "trial_days_remaining" in d
         assert 12 <= d["trial_days_remaining"] <= 14
-        assert d.get("is_active") is True
+        assert d.get("is_active") == True
 
     def test_paid_plan_returns_9999(self, fresh_user_client):
         client, db_name = _mongo()
@@ -978,7 +978,7 @@ class TestTrial:
             d = fresh_user_client.get(f"{API}/billing/me").json()
             assert d["plan"] == "starter"
             assert d["trial_days_remaining"] == 9999
-            assert d["is_active"] is True
+            assert d["is_active"] == True
         finally:
             client[db_name].users.update_one(
                 {"email": fresh_user_client.user_email}, {"$set": {"plan": "free"}}
@@ -1015,7 +1015,7 @@ class TestPaywall:
 
             # Verify billing reflects expiry
             d = s.get(f"{API}/billing/me").json()
-            assert d.get("is_active") is False, f"Expected is_active=False after expiry: {d}"
+            assert d.get("is_active") == False, f"Expected is_active=False after expiry: {d}"
 
             # Agent create blocked
             r = s.post(f"{API}/agents", json={"name": "TEST_blocked", "role": "x"})

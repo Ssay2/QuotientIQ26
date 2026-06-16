@@ -25,12 +25,38 @@
         --border: 0 0% 90%;
         --input: 0 0% 90%;
         --ring: 0 0% 4%;
+        --surface: 0 0% 100%;
+        --surface-foreground: 0 0% 4%;
         --chart-1: 0 0% 4%;
         --chart-2: 0 0% 32%;
         --chart-3: 0 0% 64%;
         --chart-4: 0 0% 83%;
         --chart-5: 0 0% 90%;
         --radius: 0.5rem;
+    }
+
+    .dark {
+        --background: 0 0% 6%;
+        --foreground: 0 0% 96%;
+        --card: 0 0% 9%;
+        --card-foreground: 0 0% 96%;
+        --popover: 0 0% 9%;
+        --popover-foreground: 0 0% 96%;
+        --primary: 0 0% 96%;
+        --primary-foreground: 0 0% 6%;
+        --secondary: 0 0% 12%;
+        --secondary-foreground: 0 0% 96%;
+        --muted: 0 0% 10%;
+        --muted-foreground: 0 0% 60%;
+        --accent: 0 0% 14%;
+        --accent-foreground: 0 0% 96%;
+        --destructive: 0 72% 52%;
+        --destructive-foreground: 0 0% 100%;
+        --border: 0 0% 16%;
+        --input: 0 0% 16%;
+        --ring: 0 0% 96%;
+        --surface: 0 0% 9%;
+        --surface-foreground: 0 0% 96%;
     }
 }
 
@@ -98,8 +124,8 @@ h1, h2, h3, h4, h5 {
 .blink { animation: blink 1s steps(2) infinite; }
 
 /* Chat bubbles */
-.bubble-user { background: #0A0A0A; color: white; }
-.bubble-ai { background: #FAFAFA; color: #0A0A0A; border: 1px solid #E5E5E5; }
+.bubble-user { background: hsl(var(--foreground)); color: hsl(var(--background)); }
+.bubble-ai { background: hsl(var(--muted)); color: hsl(var(--foreground)); border: 1px solid hsl(var(--border)); }
 
 /* Underline link */
 .u-link { position: relative; }

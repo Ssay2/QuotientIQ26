@@ -1,0 +1,49 @@
+{
+  "summary": "V6 testing complete. Created /app/backend/tests/test_v6_features.py with 26 new tests covering Profile/Password/Forgot+Reset/Notifications/Settings-notifications/Search/Onboarding/Chief-of-Staff/Departments/Agent-metrics/Activity/Integrations-registry/Sessions/Analytics-summary/Notification-side-effects/Account-cascade-delete. 25 pass, 1 skipped (forgot-reset full-flow requires DEV_MODE=1 to receive dev_token, which is off in this env — that's by design, not a bug). All 66 prior regression tests still pass. Total backend: 91 passing, 1 skipped. Frontend smoke tested across all new routes: /chief (workforce + textarea + departments render), /workforce (agent health renders), /industries (5 cards + 5 install buttons render with testids `industry-{id}` / `install-{id}`), /departments (page + New button), /activity (filter chips), /help (FAQ + sections), /settings (all 6 tabs present: Profile/Password/Theme/Notifications/Sessions/Danger), /forgot-password (works, sends success banner), /nonexistent (renders 404). Dashboard upgrade verified: Cost Savings $184.5 / Hours Saved 6.1 / Active Agents 8 / Tasks 41 / Performance 92% tiles, recent conversations card, agent health card with progress bars, quick-link tiles to AI Workforce / Industries / Activity / Help. Sidebar reorganized correctly into Main (Dashboard / Chief of Staff / AI Workforce / Marketplace / Industries) + Operations (Conversations / Departments / Org Chart / Company Memory / Builder / Analytics / Activity) + Workspace (Team / Billing / Audit / Developer / Settings / Help). Notification bell shows unread badge. Theme toggle: light → dark applies '.dark' class to <html> and persists. Cmd+K opens global search dialog with results. Mobile drawer (390px width) opens via [data-testid='mobile-menu'] and shows the same nav structure. Chief of Staff /api/chief/route POST returns valid LLM reply in ~10s.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "PUT /api/departments/{id}", "issue": "Requires full DepartmentIn body (name required); no PATCH support for partial updates — sending only {description: 'x'} returns 422. Cosmetic API ergonomics; not blocking."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Onboarding redirect after Register", "issue": "After successful register, app briefly navigates to /onboarding then immediately redirects to /dashboard (confirmed via framenavigated history: ['/onboarding', '/dashboard']). Backend /api/onboarding/status returns completed=false for new user, so the only redirect trigger in Onboarding.jsx line 51 (if st.data?.completed nav('/dashboard')) shouldn't fire. The bug means the 6-step wizard is unreachable on register and the spec ('Register page: successful registration redirects to /onboarding') is violated.", "selector": "/onboarding route, Onboarding.jsx useEffect line 39-56", "priority": "HIGH"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Global Search (Cmd+K) dialog", "issues": ["Console warning: 'DialogContent requires a DialogTitle for the component to be accessible for screen reader users'. Wrap with VisuallyHidden or add a DialogTitle."]},
+      {"screen": "Industries page testids", "issues": ["Spec/agent context says testids are 'industry-card-{id}' and 'install-industry-{id}' but actual code uses 'industry-{id}' and 'install-{id}'. Both work, just align docs or rename for consistency with the spec."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_v6_features.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/v6_results.xml"
+  ],
+  "action_items": [
+    "INVESTIGATE & FIX: Register → /onboarding → /dashboard redirect bug. The wizard never displays for new users. Suspect: race condition in Onboarding.jsx useEffect, or stale `user` state during first mount causing some downstream redirect we couldn't pinpoint. Add a `console.log(st.data)` at Onboarding.jsx:51 to confirm the branch firing, and also check whether `inds` or `prof` are throwing and being caught silently.",
+    "MINOR: Add DialogTitle (or VisuallyHidden) inside the GlobalSearch dialog content to fix the radix accessibility warning.",
+    "OPTIONAL: Consider supporting PATCH on /api/departments/{id} or relaxing DepartmentIn so updates can be partial.",
+    "OPTIONAL: Soft-delete API keys (active=false) instead of hard delete to preserve audit history (re-stated from iteration_5)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 2228 lines — modularization (departments, chief, notifications, onboarding, search, integrations) into separate routers is overdue.",
+    "Onboarding.jsx useEffect swallows all errors with `try { ... } catch (err) { /* noop */ }`. This makes the redirect bug above hard to debug. Add structured error logging.",
+    "Many response envelopes are inconsistent: /api/departments → {departments: []}, /api/integrations → {integrations: []}, /api/notifications → {notifications, unread}, but /api/team → list, /api/agents → list. Pick one convention.",
+    "create_notification side-effects are hooked into agent.create, team.invite, knowledge.upload, billing webhook — but not into conversation.create per spec ('new conversations' notification). Verify whether conversation insert should also fire a 'conversation.new' notification.",
+    "/api/chief/route is unauthenticated-friendly (200 even when LLM key fails). Consider returning 503 if the streaming chat completion errors out instead of returning an empty reply string.",
+    "PUT /api/departments/{id} uses DepartmentIn (name required) instead of an Update DTO with all optional fields. Partial updates impossible."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_v6_features.py (new file, 26 tests covering all V6 endpoints)"
+  ],
+  "success_rate": {"backend": "100% (91/91 executed, 1 conditional skip)", "frontend": "~95% (all routes render, all critical features work; 1 HIGH-priority Register→Onboarding redirect bug)"},
+  "test_credentials": "admin@quotientiq.com / admin123 (from /app/memory/test_credentials.md). UI tests also created ephemeral users obtest_*, uitest_*, v6_* — all benign.",
+  "seed_data_creation": "V6 test suite creates ~10 ephemeral users (v6_*, obtest_*, uitest_*) and 1-2 ephemeral departments per run. TestAccountDelete cleans its user. Admin dashboard now has 8 active agents (some leftover from prior test installs like 'Notif Test Agent ...', 'Side Effect Agent'). Non-blocking.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Two test files now: /app/backend/tests/backend_test.py (66 tests, V1-V5) + /app/backend/tests/test_v6_features.py (26 tests, V6 features). Run both with `ADMIN_PASSWORD=admin123 ADMIN_EMAIL=admin@quotientiq.com pytest /app/backend/tests/ -v`. Frontend testids confirmed for V6: nav-{dashboard|chief|workforce|marketplace|industries|conversations|departments|org|memory|builder|analytics|activity|team|billing|audit|developer|settings|help}, notification-bell, theme-toggle, mobile-menu, industry-{id}, install-{id}, forgot-email, forgot-submit, forgot-sent, dev-token, reg-{name|company|email|password}, register-submit, onboarding-skip. Critical OPEN BUG: Register → Onboarding redirect immediately bounces to /dashboard — investigate Onboarding.jsx useEffect. /api/chief/route LLM call takes ~10-30s; keep timeout >=60s. Forgot/reset full flow requires DEV_MODE=1 env to surface dev_token (currently off).",
+  "rca_of_the_issue": "Register → Dashboard bug RCA: Register.jsx:26 calls `nav('/onboarding')` after successful register. Playwright framenavigated events confirm: URL becomes /onboarding then immediately changes to /dashboard. The only nav('/dashboard') call inside Onboarding.jsx is line 51 `if (st.data?.completed) nav('/dashboard')`. Backend /api/onboarding/status for a freshly registered user returns `{current_step:1, completed:false, ...}` — so this branch should NOT fire. Yet the redirect happens. Possible causes (for main agent to verify): (a) the cookie/auth header is not yet sent on the first /onboarding/status request, returning 401 which is silently caught — but the catch block doesn't redirect either; (b) some other component (AppShell?) reads st.data?.checks and force-redirects to dashboard if checks.first_agent is true (which IS true for new users since register seeds a default Customer Support Agent); (c) a race where `useAuth().user` is null for one render, triggering an unintended redirect somewhere. Recommend adding `console.log` traces in Onboarding.jsx:39-55 and any global guard, plus checking if AppShell or a layout component redirects when an onboarding 'check' is satisfied."
+}

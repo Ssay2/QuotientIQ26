@@ -23,7 +23,7 @@ export default function Register() {
     try {
       await register(form);
       toast.success("Account created. Welcome to QuotientIQ.");
-      nav("/dashboard");
+      nav("/onboarding");
     } catch (e) {
       const msg = formatErr(e?.response?.data?.detail) || e.message;
       setErr(msg);

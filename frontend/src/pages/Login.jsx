@@ -71,7 +71,10 @@ export default function Login() {
                 <Input data-testid="login-email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@company.com" className="h-11 border-border rounded-md" />
               </div>
               <div className="space-y-2">
-                <Label className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Password</Label>
+                <div className="flex items-center justify-between">
+                  <Label className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Password</Label>
+                  <Link to="/forgot-password" data-testid="link-forgot" className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground hover:text-foreground">Forgot?</Link>
+                </div>
                 <Input data-testid="login-password" type="password" required value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" className="h-11 border-border rounded-md" />
               </div>
 
