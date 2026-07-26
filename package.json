@@ -1,0 +1,20 @@
+{
+	"name": "quotientiq",
+	"version": "0.1.0",
+	"private": true,
+	"workspaces": [
+		"apps/*",
+		"packages/*"
+	],
+	"scripts": {
+		"dev": "npm run dev --workspace @quotientiq/web",
+		"dev:web": "npm run dev --workspace @quotientiq/web",
+		"dev:api": "npm run dev --workspace @quotientiq/api",
+		"build": "npm run build --workspace @quotientiq/shared && npm run build --workspace @quotientiq/api && npm run build --workspace @quotientiq/web",
+		"lint": "npm run lint --workspace @quotientiq/web && npm run lint --workspace @quotientiq/api",
+		"typecheck": "npm run typecheck --workspace @quotientiq/shared && npm run typecheck --workspace @quotientiq/api && npm run typecheck --workspace @quotientiq/web"
+	},
+	"engines": {
+		"node": ">=20.0.0"
+	}
+}
