@@ -18,6 +18,7 @@ Enterprise AI agent marketplace and operating system for businesses.
 - [Master Specification](docs/master-specification.md)
 - [Implementation Roadmap](docs/execution/implementation-roadmap.md)
 - [Sprint 1 Backlog](docs/execution/sprint-1-backlog.md)
+- [Supabase Integration](docs/execution/supabase-integration.md)
 
 ## What QuotientIQ Is
 

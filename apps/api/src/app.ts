@@ -8,6 +8,7 @@ import { dashboardRouter } from "./routes/dashboard.js";
 import { billingRouter } from "./routes/billing.js";
 import { authRouter } from "./routes/auth.js";
 import { agentsRouter } from "./routes/agents.js";
+import { supabaseRouter } from "./routes/supabase.js";
 import { errorHandler } from "./middleware/errors.js";
 import { rateLimit } from "./middleware/rateLimit.js";
 
@@ -28,6 +29,7 @@ export function createApp() {
   app.use("/api", marketplaceRouter);
   app.use("/api", dashboardRouter);
   app.use("/api", billingRouter);
+  app.use("/api", supabaseRouter);
 
   // Error handler (must be last)
   app.use(errorHandler);
